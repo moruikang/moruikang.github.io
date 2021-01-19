@@ -1,22 +1,96 @@
-<?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom">
-    <id>https://moruikang.github.io</id>
-    <title>Gridea</title>
-    <updated>2021-01-19T14:26:26.002Z</updated>
-    <generator>https://github.com/jpmonette/feed</generator>
-    <link rel="alternate" href="https://moruikang.github.io"/>
-    <link rel="self" href="https://moruikang.github.io/atom.xml"/>
-    <subtitle>温故而知新</subtitle>
-    <logo>https://moruikang.github.io/images/avatar.png</logo>
-    <icon>https://moruikang.github.io/favicon.ico</icon>
-    <rights>All rights reserved 2021, Gridea</rights>
-    <entry>
-        <title type="html"><![CDATA[一次OSS上传故障定位过程]]></title>
-        <id>https://moruikang.github.io/post/yi-ci-oss-shang-chuan-gu-zhang-ding-wei-guo-cheng/</id>
-        <link href="https://moruikang.github.io/post/yi-ci-oss-shang-chuan-gu-zhang-ding-wei-guo-cheng/">
-        </link>
-        <updated>2021-01-12T14:35:05.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="一-业务简介">一. 业务简介:</h3>
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>一次OSS上传故障定位过程 | Gridea</title>
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1611066370913">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="一次OSS上传故障定位过程 | Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="一. 业务简介:
+前段时间接手了一个新系统，A站点是和设备交互的java springboot服务，提供websocket，http接口。处理设备请求，和下发控制指令到设备， 接受设备上传的文件请求，并把文件上传到OSS
+###二. 问题现..." />
+    <meta name="keywords" content="" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="https://cdn.bootcss.com/highlight.js/9.12.0/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1611066370913" alt="">
+  </a>
+  <h1 class="site-title">
+    Gridea
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              一次OSS上传故障定位过程
+            </h2>
+            <div class="post-info">
+              <span>
+                2021-01-12
+              </span>
+              <span>
+                6 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content">
+                <h3 id="一-业务简介">一. 业务简介:</h3>
 <p>前段时间接手了一个新系统，A站点是和设备交互的java springboot服务，提供websocket，http接口。处理设备请求，和下发控制指令到设备， 接受设备上传的文件请求，并把文件上传到OSS</p>
 <p>###二. 问题现象描述</p>
 <p>在生产环境，3次出现A站点偶发性在上传文件到阿里云OSS时出现异常，如下是A站点上传文件到OSS时抛出的异常:</p>
@@ -91,6 +165,105 @@ at java.net.SocketInputStream.socketRead0(Native Method)
 <p>此外，我们对于线上问题定位不要被表面现象误导，以及被旁边同事不相干的怀疑误导，应该加强故障处理能力，加强工具建设：<br>
 比如看到异常报错有：createNetworkException，就应该想到网络原因<br>
 比如要学会使用Java常用诊断工具jstack，追踪堆栈调用等。</p>
-]]></content>
-    </entry>
-</feed>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li>
+<ul>
+<li><a href="#%E4%B8%80-%E4%B8%9A%E5%8A%A1%E7%AE%80%E4%BB%8B">一. 业务简介:</a>
+<ul>
+<li><a href="#1-%E7%A1%AE%E5%AE%9A%E5%BD%B1%E5%93%8D%E8%8C%83%E5%9B%B4">1)  确定影响范围</a></li>
+<li><a href="#2%E6%8E%92%E6%9F%A5%E6%97%A5%E5%BF%97">2）排查日志</a></li>
+<li><a href="#3-%E6%9F%A5%E7%9C%8B%E7%9B%91%E6%8E%A7%E6%8C%87%E6%A0%87">3） 查看监控指标</a></li>
+<li><a href="#4%E4%B8%B4%E6%97%B6%E6%96%B9%E6%A1%88">4）临时方案</a></li>
+<li><a href="#5%E6%80%80%E7%96%91%E6%96%B9%E5%90%91">5）怀疑方向</a></li>
+</ul>
+</li>
+<li><a href="#%E4%B8%89-%E5%AE%9A%E4%BD%8D%E5%92%8C%E6%81%A2%E5%A4%8D">三.  定位和恢复</a>
+<ul>
+<li><a href="#1-%E4%B8%B4%E6%97%B6%E6%81%A2%E5%A4%8D">1) 临时恢复</a></li>
+<li><a href="#2-%E4%BF%9D%E7%95%99%E7%8E%B0%E5%9C%BA">2) 保留现场</a></li>
+<li><a href="#3-%E7%BC%BA%E6%86%BE">3) 缺憾</a></li>
+</ul>
+</li>
+<li><a href="#%E5%9B%9B-%E7%BB%93%E6%9E%9C%E5%88%86%E6%9E%90">四. 结果分析:</a>
+<ul>
+<li><a href="#1%E9%80%9A%E8%BF%87wireshark%E5%88%86%E6%9E%90%E6%8A%93%E5%8C%85%E7%BB%93%E6%9E%9C%E5%A6%82%E5%9B%BE">1.通过Wireshark分析抓包结果如图：</a>
+<ul>
+<li><a href="#tcp-retransmission">TCP Retransmission</a></li>
+</ul>
+</li>
+<li><a href="#2-%E6%9F%A5%E7%9C%8Ba-upload%E6%97%A5%E5%BF%97%E5%88%86%E6%9E%90">2. 查看A-upload日志分析</a></li>
+</ul>
+</li>
+<li><a href="#%E6%80%BB%E7%BB%93">总结</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>
