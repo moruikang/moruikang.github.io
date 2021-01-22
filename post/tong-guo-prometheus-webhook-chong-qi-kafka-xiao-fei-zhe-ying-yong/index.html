@@ -1,0 +1,295 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>通过Prometheus webhook重启kafka消费者应用 | moruikang&#39; blog</title>
+<meta name="description" content="温故而知新" />
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1579081407601">
+<link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+
+<script src="https://cdn.bootcss.com/highlight.js/9.12.0/highlight.min.js"></script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1579081407601" alt="">
+  </a>
+  <h1 class="site-title">
+    moruikang&#39; blog
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              通过Prometheus webhook重启kafka消费者应用
+            </h2>
+            <div class="post-info">
+              <span>
+                2020-01-06
+              </span>
+              <span>
+                5 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content">
+                <h3 id="一-简介">一. 简介</h3>
+<p>在kafka消息队列模型里，有几个概念：</p>
+<ul>
+<li>Producer: 生产者 负责生产、发布消息到Kafka broker</li>
+<li>Broker: 用来实现数据存储的主机服务器,即kafka应用本身</li>
+<li>Consumer、ConsumerGroup: Consumer是消息消费者，向Kafka broker读取消息的客户端，每个Consumer属于一个特定的Consumer Group（可为每个Consumer指定group name，若不指定group name则属于默认的group）</li>
+</ul>
+<p>一个Consumer即是一个应用，其会主动去kafka指定的topic订阅，并消费消息，完成后commit。ConsumerGroup即同样作用的一组应用。</p>
+<p>当消费者程序处理不当，容易造成停止消费消息，监控里会发现kafka consumergroup lag	(latency，消费者落后于生产者的消息数)指标会一直显示有消息堆积，如果业务量大，可能会造成很大的损失。</p>
+<h3 id="二-临时方案-重启消费者应用">二. 临时方案-重启消费者应用</h3>
+<p>我们遇到的情况，开发开始也很难定位到代码问题，所以给出的临时方案是：定时重启。可是问题来了：<br>
+定时是定在什么时候？<br>
+即便是定时了，告警出来就不用去手动重启消费者应用了嘛？<br>
+这是一个很糟糕的方案。<br>
+我们的应用都部署在kubernetes里，监控系统使用Prometheus,于是想通过Prometheus Webhook，当监控到kafka lag堆积时触发webhook，去删除对应消费者的pod。但这种做法治标不治本，只是在某些场景下作为临时方案，最终还是需要找到问题的根因。</p>
+<h3 id="三-prometheus-webhook介绍">三. Prometheus webhook介绍</h3>
+<p>prometheus Alertmanager 支持<a href="https://prometheus.io/docs/alerting/configuration/#webhook_config">webhook</a>，触发时，Alertmanager将以以下JSON格式向配置的webhook端点发送HTTP POST请求：</p>
+<pre><code>{
+  &quot;version&quot;: &quot;4&quot;,
+  &quot;groupKey&quot;: &lt;string&gt;,    // key identifying the group of alerts (e.g. to deduplicate)
+  &quot;status&quot;: &quot;&lt;resolved|firing&gt;&quot;,
+  &quot;receiver&quot;: &lt;string&gt;,
+  &quot;groupLabels&quot;: &lt;object&gt;,
+  &quot;commonLabels&quot;: &lt;object&gt;,
+  &quot;commonAnnotations&quot;: &lt;object&gt;,
+  &quot;externalURL&quot;: &lt;string&gt;,  // backlink to the Alertmanager.
+  &quot;alerts&quot;: [
+    {
+      &quot;status&quot;: &quot;&lt;resolved|firing&gt;&quot;,
+      &quot;labels&quot;: &lt;object&gt;,
+      &quot;annotations&quot;: &lt;object&gt;,
+      &quot;startsAt&quot;: &quot;&lt;rfc3339&gt;&quot;,
+      &quot;endsAt&quot;: &quot;&lt;rfc3339&gt;&quot;,
+      &quot;generatorURL&quot;: &lt;string&gt; // identifies the entity that caused the alert
+    },
+    ...
+  ]
+}
+</code></pre>
+<h3 id="四-代码实现和配置">四. 代码实现和配置</h3>
+<h4 id="1-代码">1. 代码</h4>
+<p>使用python flask 去做webhook扩展，当kafka lag堆积，alertmanager触发webhook，发送post请求到flask。</p>
+<pre><code class="language-python">#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+from flask import Flask, request, jsonify
+import json
+
+import subprocess
+import logging
+
+
+logging.basicConfig(level=logging.DEBUG,
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('prometheus-webhook')
+
+def delete_pod():
+    try:
+        logger.info(&quot;/usr/bin/kubectl delete po -l backend=pod-labels&quot;)
+        p = subprocess.Popen(
+            [&quot;export KUBECONFIG=~/.kube/config &amp;&amp; /usr/local/bin/kubectl delete po -l backend=pod-labels&quot;], \
+                             stdout=subprocess.PIPE, shell=True)
+        outs, errs = p.communicate()
+        logger.info(outs)
+    except Exception as e:
+        logger.info(e)
+
+
+app = Flask(__name__)
+
+@app.route('/delete/pod', methods=['POST'])
+def delete():
+    # TO DO
+    # 校验
+    try:
+        data = json.loads(request.get_data())
+        alerts = data['alerts']
+        logger.info(alerts)
+        for i in alerts:
+            if i['labels']['consumergroup'] == 'kafka-user-notification-group' \
+                    and i['status'] == 'firing':
+                delete_pod()
+                response = {&quot;status&quot;: &quot;succeed&quot;}
+                logger.info(&quot;delete kafka-user-notification-group pod&quot;)
+            else:
+                logger.info(&quot;kafka-user-notification-group alert's status has resolved&quot;)
+                response = {&quot;status&quot;: &quot;succeed&quot;}
+    except Exception as e:
+        logger.info(e)
+        response = {&quot;status&quot;: &quot;failure&quot;}
+
+    return jsonify(response)
+
+if __name__ == '__main__':
+
+    app.run(host='0.0.0.0', port=8081)
+
+</code></pre>
+<h4 id="2-alertmanager配置">2. alertmanager配置</h4>
+<pre><code>  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname']
+      group_wait: 30s
+      group_interval: 1m
+      repeat_interval: 1h
+      receiver: 'alert'
+      routes:
+      - match:
+          severity: 'critical'
+          consumergroup: 'kafka-user-your-group'
+        receiver: 'webhook'
+        continue: true  # 设置为true，除了触发webhook之外还继续发出告警
+   receivers:
+      - name: 'webhook'
+        webhook_configs:
+        - url: 'http://host:8081/delete/pod'
+          send_resolved: true
+</code></pre>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li>
+<ul>
+<li><a href="#%E4%B8%80-%E7%AE%80%E4%BB%8B">一. 简介</a></li>
+<li><a href="#%E4%BA%8C-%E4%B8%B4%E6%97%B6%E6%96%B9%E6%A1%88-%E9%87%8D%E5%90%AF%E6%B6%88%E8%B4%B9%E8%80%85%E5%BA%94%E7%94%A8">二. 临时方案-重启消费者应用</a></li>
+<li><a href="#%E4%B8%89-prometheus-webhook%E4%BB%8B%E7%BB%8D">三. Prometheus webhook介绍</a></li>
+<li><a href="#%E5%9B%9B-%E4%BB%A3%E7%A0%81%E5%AE%9E%E7%8E%B0%E5%92%8C%E9%85%8D%E7%BD%AE">四. 代码实现和配置</a>
+<ul>
+<li><a href="#1-%E4%BB%A3%E7%A0%81">1. 代码</a></li>
+<li><a href="#2-alertmanager%E9%85%8D%E7%BD%AE">2. alertmanager配置</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/prometheus-quan-mian-jian-kong-kafka-ji-qun">
+              <h3 class="post-title">
+                Prometheus全面监控kafka集群
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a> | 
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">RSS</a>
+</div>
+
+<script>
+  hljs.initHighlightingOnLoad()
+
+  let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+  // This should probably be throttled.
+  // Especially because it triggers during smooth scrolling.
+  // https://lodash.com/docs/4.17.10#throttle
+  // You could do like...
+  // window.addEventListener("scroll", () => {
+  //    _.throttle(doThatStuff, 100);
+  // });
+  // Only not doing it here to keep this Pen dependency-free.
+
+  window.addEventListener("scroll", event => {
+    let fromTop = window.scrollY;
+
+    mainNavLinks.forEach((link, index) => {
+      let section = document.getElementById(decodeURI(link.hash).substring(1));
+      let nextSection = null
+      if (mainNavLinks[index + 1]) {
+        nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+      }
+      if (section.offsetTop <= fromTop) {
+        if (nextSection) {
+          if (nextSection.offsetTop > fromTop) {
+            link.classList.add("current");
+          } else {
+            link.classList.remove("current");    
+          }
+        } else {
+          link.classList.add("current");
+        }
+      } else {
+        link.classList.remove("current");
+      }
+    });
+  });
+
+</script>
+
+      </div>
+    </div>
+  </body>
+</html>

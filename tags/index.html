@@ -2,26 +2,28 @@
   <head>
   <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Gridea</title>
-<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1611066627969">
-<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<title>moruikang&#39; blog</title>
+<meta name="description" content="温故而知新" />
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1579081407601">
+<link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
 <link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
-<link rel="alternate" type="application/atom+xml" title="Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+
+<script src="https://cdn.bootcss.com/highlight.js/9.12.0/highlight.min.js"></script>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
 
 
 
-  <meta name="description" content="温故而知新" />
   </head>
   <body>
     <div class="main">
       <div class="main-content">
         <div class="site-header">
   <a href="https://moruikang.github.io">
-  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1611066627969" alt="">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1579081407601" alt="">
   </a>
   <h1 class="site-title">
-    Gridea
+    moruikang&#39; blog
   </h1>
   <p class="site-description">
     温故而知新
@@ -46,12 +48,6 @@
         </a>
       
     
-      
-        <a href="/post/about" class="menu">
-          关于
-        </a>
-      
-    
   </div>
   <div class="social-container">
     
@@ -71,14 +67,67 @@
 
         <div class="tags-container">
           
+            <a class="tag" href="https://moruikang.github.io/tag/PAHX5vS8_">AWS</a>
+          
+            <a class="tag" href="https://moruikang.github.io/tag/3DTODJBn7L">autoscaling</a>
+          
+            <a class="tag" href="https://moruikang.github.io/tag/aa7HEEf7S">kubernetes</a>
+          
+            <a class="tag" href="https://moruikang.github.io/tag/oXYaVYkzW">prometheus</a>
+          
+            <a class="tag" href="https://moruikang.github.io/tag/u5orQEpN4">kafka</a>
+          
+            <a class="tag" href="https://moruikang.github.io/tag/KnYGazVGKS">kops</a>
+          
+            <a class="tag" href="https://moruikang.github.io/tag/kb_TxSqjd-">terraform</a>
+          
         </div>
 
         <div class="site-footer">
-  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
-  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
-    <i class="ri-rss-line"></i> RSS
-  </a>
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a> | 
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">RSS</a>
 </div>
+
+<script>
+  hljs.initHighlightingOnLoad()
+
+  let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+  // This should probably be throttled.
+  // Especially because it triggers during smooth scrolling.
+  // https://lodash.com/docs/4.17.10#throttle
+  // You could do like...
+  // window.addEventListener("scroll", () => {
+  //    _.throttle(doThatStuff, 100);
+  // });
+  // Only not doing it here to keep this Pen dependency-free.
+
+  window.addEventListener("scroll", event => {
+    let fromTop = window.scrollY;
+
+    mainNavLinks.forEach((link, index) => {
+      let section = document.getElementById(decodeURI(link.hash).substring(1));
+      let nextSection = null
+      if (mainNavLinks[index + 1]) {
+        nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+      }
+      if (section.offsetTop <= fromTop) {
+        if (nextSection) {
+          if (nextSection.offsetTop > fromTop) {
+            link.classList.add("current");
+          } else {
+            link.classList.remove("current");    
+          }
+        } else {
+          link.classList.add("current");
+        }
+      } else {
+        link.classList.remove("current");
+      }
+    });
+  });
+
+</script>
 
       </div>
     </div>

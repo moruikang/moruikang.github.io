@@ -1,0 +1,348 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>云上(AWS)kubernetes自动扩容缩容最佳实践 | moruikang&#39; blog</title>
+<meta name="description" content="温故而知新" />
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1579081407601">
+<link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+
+<script src="https://cdn.bootcss.com/highlight.js/9.12.0/highlight.min.js"></script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1579081407601" alt="">
+  </a>
+  <h1 class="site-title">
+    moruikang&#39; blog
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              云上(AWS)kubernetes自动扩容缩容最佳实践
+            </h2>
+            <div class="post-info">
+              <span>
+                2020-01-13
+              </span>
+              <span>
+                10 min read
+              </span>
+              
+                <a href="https://moruikang.github.io/tag/PAHX5vS8_" class="post-tag">
+                  # AWS
+                </a>
+              
+                <a href="https://moruikang.github.io/tag/3DTODJBn7L" class="post-tag">
+                  # autoscaling
+                </a>
+              
+                <a href="https://moruikang.github.io/tag/aa7HEEf7S" class="post-tag">
+                  # kubernetes
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content">
+                <h3 id="为什么需要扩容缩容">为什么需要扩容缩容？</h3>
+<p>相信很多企业会面临扩容缩容的场景，当业务规模增多时，我们需要快速的扩大我们的应用及基础架构，当需求减少时我们也需要适当缩减开支，又不能影响当前服务稳定性。Kubernetes是易于扩展的，它具有许多工具，可根据需求和有效的指标来扩展应用程序及其托管的基础架构。</p>
+<h3 id="一-kubernetes-autoscaling">一. kubernetes autoscaling</h3>
+<p>kubernetes给我们提供了以下2个纬度的扩容方法：</p>
+<h4 id="1-基于pod的伸缩">1. 基于pod的伸缩</h4>
+<h5 id="11-horizontal-pod-autoscalerhpa">1.1 Horizontal Pod Autoscaler（HPA）</h5>
+<p>可以基于CPU/MEM利用率自动伸缩replication controller、deployment和replica set中的pod数量;也可以基于外部指标或者自定义指标伸缩，比如来自metrics.k8s.io，external.metrics.k8s.io和custom.metrics.k8s.io的指标。<br>
+伸缩算法细节：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
+#  ceil：返回不小于value 的下一个整数
+</code></pre>
+<p>举以下例子</p>
+<pre><code>apiVersion: autoscaling/v2beta1
+kind: HorizontalPodAutoscaler
+metadata:
+name: nginx
+namespace: default
+spec:
+maxReplicas: 6
+minReplicas: 1
+scaleTargetRef:
+  apiVersion: extensions/v1beta1
+  kind: Deployment
+  name: nginx
+metrics:
+- type: Resource #指标来源自metrics server
+  resource:
+    name: cpu
+    targetAverageValue: 100m
+</code></pre>
+<p>如果当前是1个pod，目标设定值为100m，pod cpu平均指标达到200m，那么由算法计算公式：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )] 
+等于
+desiredReplicas = ceil[1 * (200/100)] = 2 (个)
+</code></pre>
+<p>于是pod的数量将会增加到2个。<br>
+如果当前是2个pod，目标设定值为100m，当前cpu指标为50m，那么由算法计算公式：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )] 
+等于
+desiredReplicas = ceil[2 * (50/100)] = 1 (个)
+</code></pre>
+<p>于是pod的数量将会减少到1个。<br>
+如果计算出的缩放比例接近1.0（跟据--horizontal-pod-autoscaler-tolerance 参数全局配置的容忍值，默认为0.1），将会放弃本次缩放。<br>
+<img src="https://moruikang.github.io/post-images/1578966400151.jpg" alt=""><br>
+在使用HPA时需要关注以下几点：</p>
+<ul>
+<li>HPA的默认检查间隔为30秒。可以通过控制器的&quot;horizo​​ntal-pod-autoscaler-sync-period&quot;标志进行配置</li>
+<li>默认HPA相对指标误差为10％</li>
+<li>在最后一次扩展pod发生后，HPA需等待3分钟，以使指标稳定下来。可以通过&quot; horizo​​ntal-pod-autoscaler-upscale-delay&quot;参数进行调整</li>
+<li>从上一次缩小pod开始，HPA等待5分钟，以避免伸缩抖动。可通过以下方式配置：&quot;horizo​​ntal-pod-autoscaler-downscale-delay&quot;参数进行调整</li>
+<li>HPA与deployment一起使用时效果最好
+<h5 id="12-vertical-pod-autoscalervpa">1.2 Vertical Pod Autoscaler（VPA）</h5>
+VPA主要用于有状态服务，它可根据需要为Pod增加CPU或内存——它也适用于无状态的Pod。当触发到VPA设定的阈值时，pod会被重新启动以更新新的CPU和内存资源请求，以避免pod内的容器OOM（内存不足）事件。重新启动Pod的时候，VPA始终确保根据Pod分配预算（PDB）确定最小数量，您可以设置可用pod数量的最大和最小限制。</li>
+</ul>
+<h4 id="2-基于集群级别的自动伸缩cluster-autoscaling简称ca主要是扩容缩容节点">2. 基于集群级别的自动伸缩(Cluster Autoscaling，简称CA，主要是扩容缩容节点)</h4>
+<ul>
+<li>扩容：当集群中资源不足，kubernetes scheduler无法调度pod到资源充足的节点，pod会处于pending状态，这时候需要扩容集群节点。</li>
+<li>缩容：集群中有一些节点未被充分利用的时间很长，造成浪费，这时候它们的容器可以驱逐到其他现有节点上，然后终止这些节点，完成集群缩容。</li>
+</ul>
+<h5 id="21-什么时候ca扩容节点">2.1 什么时候CA扩容节点？</h5>
+<p>当存在由于资源不足而kubernetes scheduler无法调度的Pod时，CA会增加群集的大小。可以将其配置为不向上或向下扩展一定数量的计算机。下图是扩展决策的概述<br>
+<img src="https://moruikang.github.io/post-images/1578968033883.jpg" alt=""></p>
+<ul>
+<li>1 集群自动缩放算法检查pending状态的Pod</li>
+<li>2 如果出现以下情况，CA将申请一个新的节点：1）没有足够的集群资源来满足pod requests resource而处于pending状态的Pod；2）集群或节点未达到用户定义的最大节点数。</li>
+<li>3 AWS上kubernetes节点都是使用autoscaling group起的，一旦加入新节点，Kubernetes就会检测到</li>
+<li>4 Kubernetes scheduler将pending的Pod调度到新节点</li>
+<li>5 如果仍有pod处于pending状态，返回步骤1</li>
+</ul>
+<h5 id="22-什么时候ca缩容节点">2.2 什么时候CA缩容节点？</h5>
+<p>当该节点上的Pod resource requests低于用户定义的阈值（默认为50％节点资源利用率）时，将开始检查该节点是否可以安全删除。需要注意的是，节点缩减检查不考虑实际的CPU/MEM使用情况，而是仅查看调度到该节点上的所有Pod的resource requests。一旦通过检查发现节点的资源利用率过低，就会调用实际的Kubernetes调度算法，确定在该节点上运行的Pod是否可以迁移到其他节点,最后群集通过autoscaling group缩容。</p>
+<p>以上是kubernetes扩容所容相关的基本原理，那么在AWS(或者其他云，大同小异)上，我们是如何做到弹性伸缩的？</p>
+<h3 id="二-aws上实践">二. AWS上实践</h3>
+<h4 id="1-hpa实践">1. HPA实践</h4>
+<p>前提：</p>
+<ul>
+<li>pod资源必须根据实际情况设置 requests 和 limit，分一下几种情况讨论扩容缩容时遇到的情况<br>
+1）如果没有resource requests，容易造成scheduler调度不合理，pod的资源无限制扩张，有可能造成node内存被挤爆，造成宕机；<br>
+2）仅设置了resource requests，此时limit默认等于requests如果pod内存增长到到requests，pod内容器OOM，影响业务稳定;pod的CPU达到limit则仅会使得程序变慢，不会OOM；<br>
+3）合理根据压测结果和长期监控dashboard曲线图设置request,limit设置比requests高10%~20%</li>
+<li>pod探针必须有readiness探针<br>
+HPA设置后，pod的数量会增多或者减少。设置readiness探针会使pod内的应用在完全起来时，才会接收请求，有助于服务稳定。</li>
+</ul>
+<p>那么，HPA的指标和阈值该如何定？</p>
+<ul>
+<li>
+<p>内部指标<br>
+kubernetes内部指标有CPU/MEM/DISK，通常会使用CPU/MEM来做HPA的指标，这两个指标来自<a href="https://kubernetes.io/docs/tasks/debug-application-cluster/resource-metrics-pipeline/#metrics-server">metrics-server</a> ,直接或间接都会体现当前应用的繁忙程度。阈值建议在resource request上下浮动，原则是不能超过limit。最好的结果是当current CPU/MEM达到阈值后，开始扩容分担压力，current CPU/MEM不再增加，甚至下降；缩容则相反；</p>
+</li>
+<li>
+<p>外部指标<br>
+某些应用可能对CPU和MEM不敏感，比如消息模型的消费者对延时的消息数量敏感，这就需要外部和自定义的指标。这些指标接口有：metrics.k8s.io, custom.metrics.k8s.io, and external.metrics.k8s.io，首先推荐<a href="https://github.com/DirectXMan12/k8s-prometheus-adapter">prometheus-adapter</a>,它可以把来自prometheus的监控指标转换成kubernets可用的指标。比如prometheus监控到kafka的lag(延时消息数量)很多，通过这个指标扩容消费者pod的数量，可以减缓业务压力。</p>
+</li>
+</ul>
+<h4 id="2-cluster-autoscaling实践">2. Cluster Autoscaling实践</h4>
+<p>具体实现项目可参考这些<a href="https://kubedex.com/autoscaling/">扩容项目</a><br>
+我推荐使用kubernetes官方项目<a href="https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler">autoscaler</a><br>
+autoscaler会和AWS autoscaling group结合，定时检查集群资源使用情况，自动完成扩容缩容。<br>
+步骤1：添加auto scaling NodeGroup IAM role的权限</p>
+<pre><code>{
+    &quot;Version&quot;: &quot;2012-10-17&quot;,
+    &quot;Statement&quot;: [
+        {
+            &quot;Effect&quot;: &quot;Allow&quot;,
+            &quot;Action&quot;: [
+                &quot;autoscaling:DescribeAutoScalingGroups&quot;,
+                &quot;autoscaling:DescribeAutoScalingInstances&quot;,
+                &quot;autoscaling:DescribeLaunchConfigurations&quot;,
+                &quot;autoscaling:SetDesiredCapacity&quot;,
+                &quot;autoscaling:TerminateInstanceInAutoScalingGroup&quot;
+            ],
+            &quot;Resource&quot;: &quot;*&quot;
+        }
+    ]
+}
+</code></pre>
+<p>步骤2：安装<a href="https://github.com/helm/charts/tree/master/stable/cluster-autoscaler">cluster-autoscaler</a></p>
+<pre><code>$ helm install stable/cluster-autoscaler --name my-release --set &quot;autoscalingGroups[0].name=your-asg-name,autoscalingGroups[0].maxSize=10,autoscalingGroups[0].minSize=1&quot; --set nodeSelector.&quot;node-role\.kubernetes\.io/master&quot;=&quot;&quot; --set tolerations[0].effect=NoSchedule --set tolerations[0].key=node-role.kubernetes.io/master
+</code></pre>
+<p>这个时候可以增加一个deployment的replica去验证CA，直至有pod处于pending状态，看看是否有节点加入。<br>
+根据过往经验，AWS CA从pod处于pending状态触发扩容到新节点加入kubernetes集群在5min左右。<br>
+步骤3：安装<a href="https://github.com/pusher/k8s-spot-termination-handler">k8s-spot-termination-handler</a><br>
+当AWS EC2实例准备终止时，其实例<a href="https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/spot-interruptions.html#termination-time-metadata">元数据</a>会自动生成termination-time这个元数据。</p>
+<pre><code>$ curl -s http://169.254.169.254/latest/meta-data/spot/termination-time
+# 如果返回404，则表明当前节点不需要终止
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;iso-8859-1&quot;?&gt;
+&lt;!DOCTYPE html PUBLIC &quot;-//W3C//DTD XHTML 1.0 Transitional//EN&quot;
+	&quot;http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd&quot;&gt;
+&lt;html xmlns=&quot;http://www.w3.org/1999/xhtml&quot; xml:lang=&quot;en&quot; lang=&quot;en&quot;&gt;
+ &lt;head&gt;
+  &lt;title&gt;404 - Not Found&lt;/title&gt;
+ &lt;/head&gt;
+ &lt;body&gt;
+  &lt;h1&gt;404 - Not Found&lt;/h1&gt;
+ &lt;/body&gt;
+&lt;/html&gt;
+#如果返回200，并且有确切终止时间，则表明该节点大致在这个时间点终止。
+2015-01-05T18:02:00Z
+</code></pre>
+<p>k8s-spot-termination-handler作为daemontset安装在每个节点上，当CA准备终止节点时，k8s-spot-termination-handler通过获取termination-time这个元数据知道节点即将终止，于是优雅驱逐该节点上的Pod<br>
+安装</p>
+<pre><code>helm install stable/k8s-spot-termination-handler --namespace kube-system
+</code></pre>
+<h3 id="总结">总结</h3>
+<p>从以上可以看出，HPA的指标除了内部的CPU/MEM，也可以根据需求自定义；需要合理设置pod资源的requests/limit，HPA CPU/MEM阈值不可超过资源的limit，否则无意义。<br>
+CA与HPA密切关联，其最理想的触发指标是pod的pending状态。<br>
+合理的配置资源限制和HPA，能使节点资源利用更合理，加上CA这道利器，使得系统能稳定扛住更大的流量并发。</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li>
+<ul>
+<li><a href="#%E4%B8%BA%E4%BB%80%E4%B9%88%E9%9C%80%E8%A6%81%E6%89%A9%E5%AE%B9%E7%BC%A9%E5%AE%B9">为什么需要扩容缩容？</a></li>
+<li><a href="#%E4%B8%80-kubernetes-autoscaling">一. kubernetes autoscaling</a>
+<ul>
+<li><a href="#1-%E5%9F%BA%E4%BA%8Epod%E7%9A%84%E4%BC%B8%E7%BC%A9">1. 基于pod的伸缩</a>
+<ul>
+<li><a href="#11-horizontal-pod-autoscalerhpa">1.1 Horizontal Pod Autoscaler（HPA）</a></li>
+<li><a href="#12-vertical-pod-autoscalervpa">1.2 Vertical Pod Autoscaler（VPA）</a></li>
+</ul>
+</li>
+<li><a href="#2-%E5%9F%BA%E4%BA%8E%E9%9B%86%E7%BE%A4%E7%BA%A7%E5%88%AB%E7%9A%84%E8%87%AA%E5%8A%A8%E4%BC%B8%E7%BC%A9cluster-autoscaling%E7%AE%80%E7%A7%B0ca%E4%B8%BB%E8%A6%81%E6%98%AF%E6%89%A9%E5%AE%B9%E7%BC%A9%E5%AE%B9%E8%8A%82%E7%82%B9">2. 基于集群级别的自动伸缩(Cluster Autoscaling，简称CA，主要是扩容缩容节点)</a>
+<ul>
+<li><a href="#21-%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99ca%E6%89%A9%E5%AE%B9%E8%8A%82%E7%82%B9">2.1 什么时候CA扩容节点？</a></li>
+<li><a href="#22-%E4%BB%80%E4%B9%88%E6%97%B6%E5%80%99ca%E7%BC%A9%E5%AE%B9%E8%8A%82%E7%82%B9">2.2 什么时候CA缩容节点？</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a href="#%E4%BA%8C-aws%E4%B8%8A%E5%AE%9E%E8%B7%B5">二. AWS上实践</a>
+<ul>
+<li><a href="#1-hpa%E5%AE%9E%E8%B7%B5">1. HPA实践</a></li>
+<li><a href="#2-cluster-autoscaling%E5%AE%9E%E8%B7%B5">2. Cluster Autoscaling实践</a></li>
+</ul>
+</li>
+<li><a href="#%E6%80%BB%E7%BB%93">总结</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/tong-guo-prometheus-webhook-chong-qi-kafka-xiao-fei-zhe-ying-yong">
+              <h3 class="post-title">
+                通过Prometheus webhook重启kafka消费者应用
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a> | 
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">RSS</a>
+</div>
+
+<script>
+  hljs.initHighlightingOnLoad()
+
+  let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+  // This should probably be throttled.
+  // Especially because it triggers during smooth scrolling.
+  // https://lodash.com/docs/4.17.10#throttle
+  // You could do like...
+  // window.addEventListener("scroll", () => {
+  //    _.throttle(doThatStuff, 100);
+  // });
+  // Only not doing it here to keep this Pen dependency-free.
+
+  window.addEventListener("scroll", event => {
+    let fromTop = window.scrollY;
+
+    mainNavLinks.forEach((link, index) => {
+      let section = document.getElementById(decodeURI(link.hash).substring(1));
+      let nextSection = null
+      if (mainNavLinks[index + 1]) {
+        nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+      }
+      if (section.offsetTop <= fromTop) {
+        if (nextSection) {
+          if (nextSection.offsetTop > fromTop) {
+            link.classList.add("current");
+          } else {
+            link.classList.remove("current");    
+          }
+        } else {
+          link.classList.add("current");
+        }
+      } else {
+        link.classList.remove("current");
+      }
+    });
+  });
+
+</script>
+
+      </div>
+    </div>
+  </body>
+</html>

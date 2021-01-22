@@ -1,0 +1,429 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Prometheus全面监控kafka集群 | moruikang&#39; blog</title>
+<meta name="description" content="温故而知新" />
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1579081407601">
+<link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+
+<script src="https://cdn.bootcss.com/highlight.js/9.12.0/highlight.min.js"></script>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1579081407601" alt="">
+  </a>
+  <h1 class="site-title">
+    moruikang&#39; blog
+  </h1>
+  <p class="site-description">
+    温故而知新
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Prometheus全面监控kafka集群
+            </h2>
+            <div class="post-info">
+              <span>
+                2020-01-02
+              </span>
+              <span>
+                6 min read
+              </span>
+              
+                <a href="https://moruikang.github.io/tag/oXYaVYkzW" class="post-tag">
+                  # prometheus
+                </a>
+              
+                <a href="https://moruikang.github.io/tag/u5orQEpN4" class="post-tag">
+                  # kafka
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content">
+                <!-- more -->
+<h3 id="一-简介">一. 简介</h3>
+<p>网上看到很多使用Prometheus监控kafka集群的文章，但大多都不够详细，思来想去还是自己写一篇。<br>
+一般经验法则是：“收集所有可能/合理的指标，这些指标在故障排除时会有所帮助”。</p>
+<h4 id="如何使用prometheus监控kafka">如何使用Prometheus监控kafka？</h4>
+<p>kafka的组件如图：<br>
+<img src="https://moruikang.github.io/post-images/1577968463210.png" alt=""></p>
+<p>我们这里把kafka监控分成三大类：</p>
+<ul>
+<li>node exporter：broker系统指标</li>
+<li>JMX exporter: JMX指标</li>
+<li>kafka exporter：生产者/消费者指标</li>
+</ul>
+<h3 id="二-部署监控">二. 部署监控</h3>
+<h4 id="21-部署node-exporter监控系统级指标">2.1 部署node exporter，监控系统级指标</h4>
+<p>安装 <a href="https://github.com/prometheus/node_exporter/releases">node_exporter</a></p>
+<pre><code>$ sudo useradd --no-create-home --shell /bin/false node_exporter
+$ curl -fsSL https://github.com/prometheus/node_exporter/releases/download/v0.17.0/node_exporter-0.17.0.linux-amd64.tar.gz \
+  | sudo tar -zxvf - -C /usr/local/bin --strip-components=1 node_exporter-0.17.0.linux-amd64/node_exporter \
+  &amp;&amp; sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+$ sudo tee /etc/systemd/system/node_exporter.service &lt;&lt;&quot;EOF&quot;
+[Unit]
+Description=Node Exporter
+
+[Service]
+User=node_exporter
+Group=node_exporter
+EnvironmentFile=-/etc/sysconfig/node_exporter
+ExecStart=/usr/local/bin/node_exporter $OPTIONS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$ sudo systemctl daemon-reload &amp;&amp; \
+sudo systemctl start node_exporter &amp;&amp; \
+sudo systemctl status node_exporter &amp;&amp; \
+sudo systemctl enable node_exporter
+$ curl localhost:9100/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-cluster'
+    static_configs:
+      - targets: ['192.168.2.xx:9100']
+      - targets: ['192.168.2.xx:9100']
+      - targets: ['192.168.2.xx:9100']
+</code></pre>
+<p>推荐使用的<a href="https://github.com/moruikang/prometheus-grafana/tree/master/Kubernetes-nodes">Grafana node dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1578040237678.jpg" alt=""></p>
+<p>主机指标</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">Metrics</th>
+<th style="text-align:right">说明</th>
+<th style="text-align:right">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left">内存使用率</td>
+<td style="text-align:right">Kafka完全在RAM上运行。JVM内存设置大小不应大于可用的RAM。</td>
+<td style="text-align:right">&gt;85%</td>
+</tr>
+<tr>
+<td style="text-align:left">Swap使用率</td>
+<td style="text-align:right">注意Swap使用情况，内存不足时kafka会使用Swap,但它会降低Kafka的性能并导致操作超时</td>
+<td style="text-align:right">swap&gt; 128M</td>
+</tr>
+<tr>
+<td style="text-align:left">网络带宽</td>
+<td style="text-align:right">Kafka服务器依赖网络带宽。需要密切注意这一点，尤其是性能下降时。另外还要注意丢包率</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">磁盘使用率</td>
+<td style="text-align:right">确保随时都有足够的磁盘空间</td>
+<td style="text-align:right">&gt;85%</td>
+</tr>
+<tr>
+<td style="text-align:left">磁盘IO</td>
+<td style="text-align:right">Kafka中的磁盘是顺序的读写的</td>
+<td style="text-align:right">None</td>
+</tr>
+</tbody>
+</table>
+<h4 id="22-部署jmx-exporter监控jmx指标">2.2 部署jmx exporter，监控JMX指标</h4>
+<p>安装<a href="https://github.com/prometheus/jmx_exporter">jmx_exporter</a>到kafka安装目录(例如/opt/kafka_2.11-2.0.0)</p>
+<pre><code>$ wget https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/0.12.0/jmx_prometheus_javaagent-0.12.0.jar
+$ wget https://raw.githubusercontent.com/prometheus/jmx_exporter/master/example_configs/kafka-2_0_0.yml
+$ vim bin/kafka-server-start.sh
+#在文件开始处添加
+export KAFKA_OPTS=&quot;-javaagent:/opt/kafka_2.11-2.0.0/jmx_prometheus_javaagent-0.11.0.jar=9990:/opt/kafka_2.11-2.0.0/kafka-2_0_0.yml&quot;
+</code></pre>
+<p>重启kafka<br>
+验证指标:</p>
+<pre><code>$ curl localhost:9990/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-jmx-exporter'
+    static_configs:
+      - targets: ['192.168.2.xx:9990']
+      - targets: ['192.168.2.xx:9990']
+      - targets: ['192.168.2.xx:9990']
+</code></pre>
+<p>推荐使用的Grafana <a href="https://grafana.com/grafana/dashboards/721">kafka jmx exporter dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1578042096280.jpg" alt=""></p>
+<p>JMX指标：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">Metrics</th>
+<th style="text-align:right">说明</th>
+<th style="text-align:right">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left">kafka_server_replicamanager_underreplicatedpartitions</td>
+<td style="text-align:right">未复制的分区数</td>
+<td style="text-align:right">&gt;0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_controller_kafkacontroller_offlinepartitionscount</td>
+<td style="text-align:right">没有存活leader的分区数，这些分区不可读也不可写</td>
+<td style="text-align:right">&gt;0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_controller_kafkacontroller_activecontrollercount</td>
+<td style="text-align:right">存活的active controller brokers</td>
+<td style="text-align:right">!=1</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_server_brokertopicmetrics_messagesin_total</td>
+<td style="text-align:right">每秒传入的消息</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">bytesin_total/bytesout_total</td>
+<td style="text-align:right">每秒传入/传出字节</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">RequestsPerSec</td>
+<td style="text-align:right">{Produce/FetchConsumer/FetchFollower} - 每秒请求数</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">TotalTimeMs</td>
+<td style="text-align:right">{Produce/FetchConsumer/FetchFollower} – 处理一次请求时间</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_controller_controllerstats_uncleanleaderelections_total</td>
+<td style="text-align:right">有问题的leader选举次数</td>
+<td style="text-align:right">!=0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_server_replicamanager_partitioncount</td>
+<td style="text-align:right">集群的分区数</td>
+<td style="text-align:right">!= 你的分区数</td>
+</tr>
+<tr>
+<td style="text-align:left">isrshrinks / isrexpands</td>
+<td style="text-align:right">当broker崩溃时，partition的ISR将缩小。当broker恢复后，当replica全部同步数据后，分区的ISR将扩展。</td>
+<td style="text-align:right">!=0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_network_socketserver_networkprocessoravgidlepercent</td>
+<td style="text-align:right">网络处理器的平均空闲时间</td>
+<td style="text-align:right">&lt; 0.3</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent_count</td>
+<td style="text-align:right">处理请求线程的平均空闲时间</td>
+<td style="text-align:right">&lt; 0.3</td>
+</tr>
+<tr>
+<td style="text-align:left">jvm_memory_bytes_used</td>
+<td style="text-align:right">Java进程动态分配的内存</td>
+<td style="text-align:right">None</td>
+</tr>
+</tbody>
+</table>
+<h4 id="23-部署kafka-exporter监控消费者指标">2.3 部署kafka exporter，监控消费者指标</h4>
+<p>安装<a href="https://github.com/danielqsj/kafka_exporter/releases">kafka_exporter</a></p>
+<pre><code>$ sudo useradd --no-create-home --shell /bin/false kafka_exporter
+$ curl -fsSL https://github.com/danielqsj/kafka_exporter/releases/download/v1.2.0/kafka_exporter-1.2.0.linux-amd64.tar.gz | \
+sudo tar -zxvf - -C /usr/local/bin --strip-components=1 kafka_exporter-1.2.0.linux-amd64/kafka_exporter  &amp;&amp; \
+sudo chown kafka_exporter:kafka_exporter /usr/local/bin/kafka_exporter
+$ sudo tee /etc/systemd/system/kafka_exporter.service &lt;&lt;&quot;EOF&quot;
+[Unit]
+Description=Kafka Exporter
+
+[Service]
+User=kafka_exporter
+Group=kafka_exporter
+EnvironmentFile=-/etc/sysconfig/kafka_exporter
+ExecStart=/usr/local/bin/kafka_exporter $OPTIONS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$ sudo mkdir -p /etc/sysconfig &amp;&amp; sudo tee /etc/sysconfig/kafka_exporter &lt;&lt;&quot;EOF&quot;
+OPTIONS=&quot;--kafka.server=localhost:9092&quot; # kafka host:port
+EOF
+$ sudo systemctl daemon-reload &amp;&amp; \
+sudo systemctl start kafka_exporter &amp;&amp; \
+sudo systemctl status kafka_exporter &amp;&amp; \
+sudo systemctl enable kafka_exporter
+$ curl localhost:9308/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['192.168.2.xx:9308']
+</code></pre>
+<p>推荐使用的Grafana <a href="https://grafana.com/grafana/dashboards/7589">kafka exporter overview dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1578044648009.jpg" alt=""><br>
+kafka exporter指标：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">Metrics</th>
+<th style="text-align:right">说明</th>
+<th style="text-align:right">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left">kafka_consumergroup_lag</td>
+<td style="text-align:right">消费者落后于生产者的消息数</td>
+<td style="text-align:right">&gt; 20</td>
+</tr>
+</tbody>
+</table>
+<p>如果使用helm部署kafka exporter里可以考虑我自己简单写的<a href="https://github.com/moruikang/kafka-exporter-helm">helm chart</a><br>
+备注：最近发现 kafka exporter github作者出了自己的<a href="https://github.com/danielqsj/kafka_exporter/tree/master/charts/kafka-exporter">helm chart</a><br>
+建议使用官方的。</p>
+<h3 id="三-kafka黑盒监控">三. kafka黑盒监控</h3>
+<p>在集群上建立一个专门的topic, 监控程序实时的写入数据, 当无法写入或写入耗时达到阈值时报警, 基本上都第一时间发现问题。</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li>
+<ul>
+<li><a href="#%E4%B8%80-%E7%AE%80%E4%BB%8B">一. 简介</a>
+<ul>
+<li><a href="#%E5%A6%82%E4%BD%95%E4%BD%BF%E7%94%A8prometheus%E7%9B%91%E6%8E%A7kafka">如何使用Prometheus监控kafka？</a></li>
+</ul>
+</li>
+<li><a href="#%E4%BA%8C-%E9%83%A8%E7%BD%B2%E7%9B%91%E6%8E%A7">二. 部署监控</a>
+<ul>
+<li><a href="#21-%E9%83%A8%E7%BD%B2node-exporter%E7%9B%91%E6%8E%A7%E7%B3%BB%E7%BB%9F%E7%BA%A7%E6%8C%87%E6%A0%87">2.1 部署node exporter，监控系统级指标</a></li>
+<li><a href="#22-%E9%83%A8%E7%BD%B2jmx-exporter%E7%9B%91%E6%8E%A7jmx%E6%8C%87%E6%A0%87">2.2 部署jmx exporter，监控JMX指标</a></li>
+<li><a href="#23-%E9%83%A8%E7%BD%B2kafka-exporter%E7%9B%91%E6%8E%A7%E6%B6%88%E8%B4%B9%E8%80%85%E6%8C%87%E6%A0%87">2.3 部署kafka exporter，监控消费者指标</a></li>
+</ul>
+</li>
+<li><a href="#%E4%B8%89-kafka%E9%BB%91%E7%9B%92%E7%9B%91%E6%8E%A7">三. kafka黑盒监控</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/shi-yong-kops-he-terraform-zai-aws-bu-shu-kubernetes-gao-ke-yong-ji-qun">
+              <h3 class="post-title">
+                使用Kops和Terraform在AWS部署Kubernetes高可用集群
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a> | 
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">RSS</a>
+</div>
+
+<script>
+  hljs.initHighlightingOnLoad()
+
+  let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+  // This should probably be throttled.
+  // Especially because it triggers during smooth scrolling.
+  // https://lodash.com/docs/4.17.10#throttle
+  // You could do like...
+  // window.addEventListener("scroll", () => {
+  //    _.throttle(doThatStuff, 100);
+  // });
+  // Only not doing it here to keep this Pen dependency-free.
+
+  window.addEventListener("scroll", event => {
+    let fromTop = window.scrollY;
+
+    mainNavLinks.forEach((link, index) => {
+      let section = document.getElementById(decodeURI(link.hash).substring(1));
+      let nextSection = null
+      if (mainNavLinks[index + 1]) {
+        nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+      }
+      if (section.offsetTop <= fromTop) {
+        if (nextSection) {
+          if (nextSection.offsetTop > fromTop) {
+            link.classList.add("current");
+          } else {
+            link.classList.remove("current");    
+          }
+        } else {
+          link.classList.add("current");
+        }
+      } else {
+        link.classList.remove("current");
+      }
+    });
+  });
+
+</script>
+
+      </div>
+    </div>
+  </body>
+</html>

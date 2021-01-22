@@ -1,96 +1,993 @@
 <?xml version="1.0" encoding="utf-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://moruikang.github.io</id>
-    <title>Gridea</title>
-    <updated>2021-01-19T14:56:05.885Z</updated>
+    <title>moruikang&apos; blog</title>
+    <updated>2020-01-15T09:43:50.073Z</updated>
     <generator>https://github.com/jpmonette/feed</generator>
     <link rel="alternate" href="https://moruikang.github.io"/>
     <link rel="self" href="https://moruikang.github.io/atom.xml"/>
     <subtitle>温故而知新</subtitle>
     <logo>https://moruikang.github.io/images/avatar.png</logo>
     <icon>https://moruikang.github.io/favicon.ico</icon>
-    <rights>All rights reserved 2021, Gridea</rights>
+    <rights>All rights reserved 2020, moruikang&apos; blog</rights>
     <entry>
-        <title type="html"><![CDATA[一次OSS上传故障定位过程]]></title>
-        <id>https://moruikang.github.io/post/yi-ci-oss-shang-chuan-gu-zhang-ding-wei-guo-cheng/</id>
-        <link href="https://moruikang.github.io/post/yi-ci-oss-shang-chuan-gu-zhang-ding-wei-guo-cheng/">
+        <title type="html"><![CDATA[云上(AWS)kubernetes自动扩容缩容最佳实践]]></title>
+        <id>https://moruikang.github.io/post/qian-tan-kubernetes-zi-dong-kuo-rong-yu-suo-rong</id>
+        <link href="https://moruikang.github.io/post/qian-tan-kubernetes-zi-dong-kuo-rong-yu-suo-rong">
         </link>
-        <updated>2021-01-12T14:35:05.000Z</updated>
-        <content type="html"><![CDATA[<h3 id="一-业务简介">一. 业务简介:</h3>
-<p>前段时间接手了一个新系统，A站点是和设备交互的java springboot服务，提供websocket，http接口。处理设备请求，和下发控制指令到设备， 接受设备上传的文件请求，并把文件上传到OSS</p>
-<p>###二. 问题现象描述</p>
-<p>在生产环境，3次出现A站点偶发性在上传文件到阿里云OSS时出现异常，如下是A站点上传文件到OSS时抛出的异常:</p>
-<pre><code>com.aliyun.oss.ClientException
-	at com.aliyun.oss.common.utils.ExceptionFactory.createNetworkException(ExceptionFactory.java:71)
-        ......
-
-Caused by: java.net.SocketTimeoutException
-
-...
-java.net.SocketTimeoutException
-at java.net.SocketInputStream.socketRead0(Native Method)
+        <updated>2020-01-13T09:28:58.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="为什么需要扩容缩容">为什么需要扩容缩容？</h3>
+<p>相信很多企业会面临扩容缩容的场景，当业务规模增多时，我们需要快速的扩大我们的应用及基础架构，当需求减少时我们也需要适当缩减开支，又不能影响当前服务稳定性。Kubernetes是易于扩展的，它具有许多工具，可根据需求和有效的指标来扩展应用程序及其托管的基础架构。</p>
+<h3 id="一-kubernetes-autoscaling">一. kubernetes autoscaling</h3>
+<p>kubernetes给我们提供了以下2个纬度的扩容方法：</p>
+<h4 id="1-基于pod的伸缩">1. 基于pod的伸缩</h4>
+<h5 id="11-horizontal-pod-autoscalerhpa">1.1 Horizontal Pod Autoscaler（HPA）</h5>
+<p>可以基于CPU/MEM利用率自动伸缩replication controller、deployment和replica set中的pod数量;也可以基于外部指标或者自定义指标伸缩，比如来自metrics.k8s.io，external.metrics.k8s.io和custom.metrics.k8s.io的指标。<br>
+伸缩算法细节：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
+#  ceil：返回不小于value 的下一个整数
 </code></pre>
-<h4 id="1-确定影响范围">1)  确定影响范围</h4>
-<p>A站点全线崩溃，从阿里云实时应用监控(ARMS)看到Java线程阻塞400多个； 业务上关键功能开闸指令不可用。</p>
-<h4 id="2排查日志">2）排查日志</h4>
-<p>时间节点基本处于业务高峰期，上传图片大部分失败，A站点接近崩溃，重启后过了一会又进入同样的状态。 第二次出现后还是没法定位到根本问题，A日志仅仅找到</p>
-<p>[Client]Unable to execute HTTP request: SocketTimeout<br>
-[Client]Unable to execute HTTP request: SocketTimeout<br>
-[Client]Unable to execute HTTP request: SocketTimeout<br>
-[Client]Unable to execute HTTP request: SocketTimeout</p>
-<p>阿里云实时应用监控ARMS那边可以看到完整抛出的异常，一切异常都指向OSS java sdk；</p>
-<pre><code>com.aliyun.oss.ClientException
-	at com.aliyun.oss.common.utils.ExceptionFactory.createNetworkException(ExceptionFactory.java:71)
-        ......
-
-Caused by: java.net.SocketTimeoutException
-
-...
-java.net.SocketTimeoutException
-at java.net.SocketInputStream.socketRead0(Native Method)
+<p>举以下例子</p>
+<pre><code>apiVersion: autoscaling/v2beta1
+kind: HorizontalPodAutoscaler
+metadata:
+name: nginx
+namespace: default
+spec:
+maxReplicas: 6
+minReplicas: 1
+scaleTargetRef:
+  apiVersion: extensions/v1beta1
+  kind: Deployment
+  name: nginx
+metrics:
+- type: Resource #指标来源自metrics server
+  resource:
+    name: cpu
+    targetAverageValue: 100m
 </code></pre>
-<p>期间有调整过oss java sdk的相关参数，比如oss.maxConnections，oss.socketTimeout等。</p>
-<h4 id="3-查看监控指标">3） 查看监控指标</h4>
-<p>A站点pod的CPU,MEM 负载(load)一切正常，以及pod所在的服务器CPU，内存，负载，磁盘IO，网络(带宽未超出)一切正常。</p>
-<h4 id="4临时方案">4）临时方案</h4>
-<p>第二次出现这个状况后把上传OSS API接口分离出来，单独做一个A-upload站点，不影响A开闸业务；并且A-upload支持横向扩容，可在出现故障时横向pod扩容支撑业务正常运行。</p>
-<h4 id="5怀疑方向">5）怀疑方向</h4>
-<p>当时看异常错误，表象指向OSS服务端，或者上传OSS客户端（即代码端）</p>
-<p>第三次出现OSS上传文件异常时，把A-upoad由2个pod横向扩展到4个pod，缓解业务压力，但旧的pod依然存在上传文件到OSS失败的问题。</p>
-<p>从云监控看到OSS用户层级有效请求率(返回状态码是2xx,3xx)降低到0.<br>
-<img src="https://moruikang.github.io/post-images/1611065016529.png" alt="" loading="lazy"></p>
-<h3 id="三-定位和恢复">三.  定位和恢复</h3>
-<p>第三次出现OSS异常时做了以下操作：</p>
-<h4 id="1-临时恢复">1) 临时恢复</h4>
-<p>横向扩展到4个pod后，删除原先2个异常的Pod</p>
-<h4 id="2-保留现场">2) 保留现场</h4>
-<p>把异常Pod的日志全部dump到本地<br>
-登陆到某个异常的pod的节点，抓包分析本地主机和OSS TCP通信:</p>
-<pre><code class="language-sudo"></code></pre>
-<h4 id="3-缺憾">3) 缺憾</h4>
-<p>未能保留完整的Pod现场，理论上可以新开deployment部署新的A-upload，修改Ingress把上传文件指向新的A-upload站点，保留旧的站点<br>
-未能使用jstack在pod内部追踪java堆栈信息</p>
-<h3 id="四-结果分析">四. 结果分析:</h3>
-<h4 id="1通过wireshark分析抓包结果如图">1.通过Wireshark分析抓包结果如图：</h4>
-<p>192.168.5.168是程序端主机ip， 106,14,228,23是OSS外网ip， TCP三次握手四次挥手过程出现大量TCP Retransmission，即网络丢包现象，请看如下相关知识解析<br>
-<img src="https://moruikang.github.io/post-images/1611065280408.png" alt="" loading="lazy"></p>
-<h5 id="tcp-retransmission">TCP Retransmission</h5>
-<p>在网络环境中，数据包丢失是非常常见的事情。TCP协议有内建的处理机制来确保网络数据传输正确。但是，如果看到大量的TCP重传（TCP Retransmission），则往往表示存在异常。<br>
-当数据发送方没有接收到接收方的ACK，就会TCP Retransmission。</p>
-<p>虽然很多时候是由于网络链路问题，但是也有可能是服务器压力过大或者服务器端网卡、驱动等主机故障导致。所以，在监控中出现tcp retry告警时，不要轻易判断是网络故障，一定要对全链路进行分析。</p>
-<p>我们设备调用A-upload站点Restful API上传OSS图片，A-uplad站点部署在阿里云VPC私网ECS k8s的pod内，和OSS enpoint同在一个内网，但是这里历史遗留原因使用了OSS外网地址；这台私网ECS通过一台具有公网IP的ECS主机做NAT路由转发和OSS通信，而此时服务器资源一切正常。</p>
-<p>这里已经可以看出，A-upload站点通过NAT路由转发后和OSS外网地址上传图片会存在大量网络丢包现象。</p>
-<h4 id="2-查看a-upload日志分析">2. 查看A-upload日志分析</h4>
-<p>device-upload日志中发现:<br>
-<img src="https://moruikang.github.io/post-images/1611065580049.png" alt="" loading="lazy"></p>
-<p>存在大量处于 TIME_WAITING状态的线程，和ARMS看到的线程阻塞可以联系起来。</p>
-<p>TIMED_WAITING: 线程在等待唤醒</p>
-<p>如果发现大量线程处于此状态，并且从线程的堆栈上查看到是正在执行网络读写，这可能是一个网络瓶颈问题或者第三方响应慢的问题。</p>
+<p>如果当前是1个pod，目标设定值为100m，pod cpu平均指标达到200m，那么由算法计算公式：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )] 
+等于
+desiredReplicas = ceil[1 * (200/100)] = 2 (个)
+</code></pre>
+<p>于是pod的数量将会增加到2个。<br>
+如果当前是2个pod，目标设定值为100m，当前cpu指标为50m，那么由算法计算公式：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )] 
+等于
+desiredReplicas = ceil[2 * (50/100)] = 1 (个)
+</code></pre>
+<p>于是pod的数量将会减少到1个。<br>
+如果计算出的缩放比例接近1.0（跟据--horizontal-pod-autoscaler-tolerance 参数全局配置的容忍值，默认为0.1），将会放弃本次缩放。<br>
+<img src="https://moruikang.github.io/post-images/1578966400151.jpg" alt=""><br>
+在使用HPA时需要关注以下几点：</p>
+<ul>
+<li>HPA的默认检查间隔为30秒。可以通过控制器的&quot;horizo​​ntal-pod-autoscaler-sync-period&quot;标志进行配置</li>
+<li>默认HPA相对指标误差为10％</li>
+<li>在最后一次扩展pod发生后，HPA需等待3分钟，以使指标稳定下来。可以通过&quot; horizo​​ntal-pod-autoscaler-upscale-delay&quot;参数进行调整</li>
+<li>从上一次缩小pod开始，HPA等待5分钟，以避免伸缩抖动。可通过以下方式配置：&quot;horizo​​ntal-pod-autoscaler-downscale-delay&quot;参数进行调整</li>
+<li>HPA与deployment一起使用时效果最好
+<h5 id="12-vertical-pod-autoscalervpa">1.2 Vertical Pod Autoscaler（VPA）</h5>
+VPA主要用于有状态服务，它可根据需要为Pod增加CPU或内存——它也适用于无状态的Pod。当触发到VPA设定的阈值时，pod会被重新启动以更新新的CPU和内存资源请求，以避免pod内的容器OOM（内存不足）事件。重新启动Pod的时候，VPA始终确保根据Pod分配预算（PDB）确定最小数量，您可以设置可用pod数量的最大和最小限制。</li>
+</ul>
+<h4 id="2-基于集群级别的自动伸缩cluster-autoscaling简称ca主要是扩容缩容节点">2. 基于集群级别的自动伸缩(Cluster Autoscaling，简称CA，主要是扩容缩容节点)</h4>
+<ul>
+<li>扩容：当集群中资源不足，kubernetes scheduler无法调度pod到资源充足的节点，pod会处于pending状态，这时候需要扩容集群节点。</li>
+<li>缩容：集群中有一些节点未被充分利用的时间很长，造成浪费，这时候它们的容器可以驱逐到其他现有节点上，然后终止这些节点，完成集群缩容。</li>
+</ul>
+<h5 id="21-什么时候ca扩容节点">2.1 什么时候CA扩容节点？</h5>
+<p>当存在由于资源不足而kubernetes scheduler无法调度的Pod时，CA会增加群集的大小。可以将其配置为不向上或向下扩展一定数量的计算机。下图是扩展决策的概述<br>
+<img src="https://moruikang.github.io/post-images/1578968033883.jpg" alt=""></p>
+<ul>
+<li>1 集群自动缩放算法检查pending状态的Pod</li>
+<li>2 如果出现以下情况，CA将申请一个新的节点：1）没有足够的集群资源来满足pod requests resource而处于pending状态的Pod；2）集群或节点未达到用户定义的最大节点数。</li>
+<li>3 AWS上kubernetes节点都是使用autoscaling group起的，一旦加入新节点，Kubernetes就会检测到</li>
+<li>4 Kubernetes scheduler将pending的Pod调度到新节点</li>
+<li>5 如果仍有pod处于pending状态，返回步骤1</li>
+</ul>
+<h5 id="22-什么时候ca缩容节点">2.2 什么时候CA缩容节点？</h5>
+<p>当该节点上的Pod resource requests低于用户定义的阈值（默认为50％节点资源利用率）时，将开始检查该节点是否可以安全删除。需要注意的是，节点缩减检查不考虑实际的CPU/MEM使用情况，而是仅查看调度到该节点上的所有Pod的resource requests。一旦通过检查发现节点的资源利用率过低，就会调用实际的Kubernetes调度算法，确定在该节点上运行的Pod是否可以迁移到其他节点,最后群集通过autoscaling group缩容。</p>
+<p>以上是kubernetes扩容所容相关的基本原理，那么在AWS(或者其他云，大同小异)上，我们是如何做到弹性伸缩的？</p>
+<h3 id="二-aws上实践">二. AWS上实践</h3>
+<h4 id="1-hpa实践">1. HPA实践</h4>
+<p>前提：</p>
+<ul>
+<li>pod资源必须根据实际情况设置 requests 和 limit，分一下几种情况讨论扩容缩容时遇到的情况<br>
+1）如果没有resource requests，容易造成scheduler调度不合理，pod的资源无限制扩张，有可能造成node内存被挤爆，造成宕机；<br>
+2）仅设置了resource requests，此时limit默认等于requests如果pod内存增长到到requests，pod内容器OOM，影响业务稳定;pod的CPU达到limit则仅会使得程序变慢，不会OOM；<br>
+3）合理根据压测结果和长期监控dashboard曲线图设置request,limit设置比requests高10%~20%</li>
+<li>pod探针必须有readiness探针<br>
+HPA设置后，pod的数量会增多或者减少。设置readiness探针会使pod内的应用在完全起来时，才会接收请求，有助于服务稳定。</li>
+</ul>
+<p>那么，HPA的指标和阈值该如何定？</p>
+<ul>
+<li>
+<p>内部指标<br>
+kubernetes内部指标有CPU/MEM/DISK，通常会使用CPU/MEM来做HPA的指标，这两个指标来自<a href="https://kubernetes.io/docs/tasks/debug-application-cluster/resource-metrics-pipeline/#metrics-server">metrics-server</a> ,直接或间接都会体现当前应用的繁忙程度。阈值建议在resource request上下浮动，原则是不能超过limit。最好的结果是当current CPU/MEM达到阈值后，开始扩容分担压力，current CPU/MEM不再增加，甚至下降；缩容则相反；</p>
+</li>
+<li>
+<p>外部指标<br>
+某些应用可能对CPU和MEM不敏感，比如消息模型的消费者对延时的消息数量敏感，这就需要外部和自定义的指标。这些指标接口有：metrics.k8s.io, custom.metrics.k8s.io, and external.metrics.k8s.io，首先推荐<a href="https://github.com/DirectXMan12/k8s-prometheus-adapter">prometheus-adapter</a>,它可以把来自prometheus的监控指标转换成kubernets可用的指标。比如prometheus监控到kafka的lag(延时消息数量)很多，通过这个指标扩容消费者pod的数量，可以减缓业务压力。</p>
+</li>
+</ul>
+<h4 id="2-cluster-autoscaling实践">2. Cluster Autoscaling实践</h4>
+<p>具体实现项目可参考这些<a href="https://kubedex.com/autoscaling/">扩容项目</a><br>
+我推荐使用kubernetes官方项目<a href="https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler">autoscaler</a><br>
+autoscaler会和AWS autoscaling group结合，定时检查集群资源使用情况，自动完成扩容缩容。<br>
+步骤1：添加auto scaling NodeGroup IAM role的权限</p>
+<pre><code>{
+    &quot;Version&quot;: &quot;2012-10-17&quot;,
+    &quot;Statement&quot;: [
+        {
+            &quot;Effect&quot;: &quot;Allow&quot;,
+            &quot;Action&quot;: [
+                &quot;autoscaling:DescribeAutoScalingGroups&quot;,
+                &quot;autoscaling:DescribeAutoScalingInstances&quot;,
+                &quot;autoscaling:DescribeLaunchConfigurations&quot;,
+                &quot;autoscaling:SetDesiredCapacity&quot;,
+                &quot;autoscaling:TerminateInstanceInAutoScalingGroup&quot;
+            ],
+            &quot;Resource&quot;: &quot;*&quot;
+        }
+    ]
+}
+</code></pre>
+<p>步骤2：安装<a href="https://github.com/helm/charts/tree/master/stable/cluster-autoscaler">cluster-autoscaler</a></p>
+<pre><code>$ helm install stable/cluster-autoscaler --name my-release --set &quot;autoscalingGroups[0].name=your-asg-name,autoscalingGroups[0].maxSize=10,autoscalingGroups[0].minSize=1&quot; --set nodeSelector.&quot;node-role\.kubernetes\.io/master&quot;=&quot;&quot; --set tolerations[0].effect=NoSchedule --set tolerations[0].key=node-role.kubernetes.io/master
+</code></pre>
+<p>这个时候可以增加一个deployment的replica去验证CA，直至有pod处于pending状态，看看是否有节点加入。<br>
+根据过往经验，AWS CA从pod处于pending状态触发扩容到新节点加入kubernetes集群在5min左右。<br>
+步骤3：安装<a href="https://github.com/pusher/k8s-spot-termination-handler">k8s-spot-termination-handler</a><br>
+当AWS EC2实例准备终止时，其实例<a href="https://docs.aws.amazon.com/zh_cn/AWSEC2/latest/UserGuide/spot-interruptions.html#termination-time-metadata">元数据</a>会自动生成termination-time这个元数据。</p>
+<pre><code>$ curl -s http://169.254.169.254/latest/meta-data/spot/termination-time
+# 如果返回404，则表明当前节点不需要终止
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;iso-8859-1&quot;?&gt;
+&lt;!DOCTYPE html PUBLIC &quot;-//W3C//DTD XHTML 1.0 Transitional//EN&quot;
+	&quot;http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd&quot;&gt;
+&lt;html xmlns=&quot;http://www.w3.org/1999/xhtml&quot; xml:lang=&quot;en&quot; lang=&quot;en&quot;&gt;
+ &lt;head&gt;
+  &lt;title&gt;404 - Not Found&lt;/title&gt;
+ &lt;/head&gt;
+ &lt;body&gt;
+  &lt;h1&gt;404 - Not Found&lt;/h1&gt;
+ &lt;/body&gt;
+&lt;/html&gt;
+#如果返回200，并且有确切终止时间，则表明该节点大致在这个时间点终止。
+2015-01-05T18:02:00Z
+</code></pre>
+<p>k8s-spot-termination-handler作为daemontset安装在每个节点上，当CA准备终止节点时，k8s-spot-termination-handler通过获取termination-time这个元数据知道节点即将终止，于是优雅驱逐该节点上的Pod<br>
+安装</p>
+<pre><code>helm install stable/k8s-spot-termination-handler --namespace kube-system
+</code></pre>
 <h3 id="总结">总结</h3>
-<p>此次事故可以确定是在业务高峰时，A-upload使用OSS外网地址上传图片，A-upload站点所在ECS和OSS通信存在网络抖动，即丢包现象。</p>
-<p>此外，我们对于线上问题定位不要被表面现象误导，以及被旁边同事不相干的怀疑误导，应该加强故障处理能力，加强工具建设：<br>
-比如看到异常报错有：createNetworkException，就应该想到网络原因<br>
-比如要学会使用Java常用诊断工具jstack，追踪堆栈调用等。</p>
+<p>从以上可以看出，HPA的指标除了内部的CPU/MEM，也可以根据需求自定义；需要合理设置pod资源的requests/limit，HPA CPU/MEM阈值不可超过资源的limit，否则无意义。<br>
+CA与HPA密切关联，其最理想的触发指标是pod的pending状态。<br>
+合理的配置资源限制和HPA，能使节点资源利用更合理，加上CA这道利器，使得系统能稳定扛住更大的流量并发。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[通过Prometheus webhook重启kafka消费者应用]]></title>
+        <id>https://moruikang.github.io/post/tong-guo-prometheus-webhook-chong-qi-kafka-xiao-fei-zhe-ying-yong</id>
+        <link href="https://moruikang.github.io/post/tong-guo-prometheus-webhook-chong-qi-kafka-xiao-fei-zhe-ying-yong">
+        </link>
+        <updated>2020-01-06T11:15:24.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="一-简介">一. 简介</h3>
+<p>在kafka消息队列模型里，有几个概念：</p>
+<ul>
+<li>Producer: 生产者 负责生产、发布消息到Kafka broker</li>
+<li>Broker: 用来实现数据存储的主机服务器,即kafka应用本身</li>
+<li>Consumer、ConsumerGroup: Consumer是消息消费者，向Kafka broker读取消息的客户端，每个Consumer属于一个特定的Consumer Group（可为每个Consumer指定group name，若不指定group name则属于默认的group）</li>
+</ul>
+<p>一个Consumer即是一个应用，其会主动去kafka指定的topic订阅，并消费消息，完成后commit。ConsumerGroup即同样作用的一组应用。</p>
+<p>当消费者程序处理不当，容易造成停止消费消息，监控里会发现kafka consumergroup lag	(latency，消费者落后于生产者的消息数)指标会一直显示有消息堆积，如果业务量大，可能会造成很大的损失。</p>
+<h3 id="二-临时方案-重启消费者应用">二. 临时方案-重启消费者应用</h3>
+<p>我们遇到的情况，开发开始也很难定位到代码问题，所以给出的临时方案是：定时重启。可是问题来了：<br>
+定时是定在什么时候？<br>
+即便是定时了，告警出来就不用去手动重启消费者应用了嘛？<br>
+这是一个很糟糕的方案。<br>
+我们的应用都部署在kubernetes里，监控系统使用Prometheus,于是想通过Prometheus Webhook，当监控到kafka lag堆积时触发webhook，去删除对应消费者的pod。但这种做法治标不治本，只是在某些场景下作为临时方案，最终还是需要找到问题的根因。</p>
+<h3 id="三-prometheus-webhook介绍">三. Prometheus webhook介绍</h3>
+<p>prometheus Alertmanager 支持<a href="https://prometheus.io/docs/alerting/configuration/#webhook_config">webhook</a>，触发时，Alertmanager将以以下JSON格式向配置的webhook端点发送HTTP POST请求：</p>
+<pre><code>{
+  &quot;version&quot;: &quot;4&quot;,
+  &quot;groupKey&quot;: &lt;string&gt;,    // key identifying the group of alerts (e.g. to deduplicate)
+  &quot;status&quot;: &quot;&lt;resolved|firing&gt;&quot;,
+  &quot;receiver&quot;: &lt;string&gt;,
+  &quot;groupLabels&quot;: &lt;object&gt;,
+  &quot;commonLabels&quot;: &lt;object&gt;,
+  &quot;commonAnnotations&quot;: &lt;object&gt;,
+  &quot;externalURL&quot;: &lt;string&gt;,  // backlink to the Alertmanager.
+  &quot;alerts&quot;: [
+    {
+      &quot;status&quot;: &quot;&lt;resolved|firing&gt;&quot;,
+      &quot;labels&quot;: &lt;object&gt;,
+      &quot;annotations&quot;: &lt;object&gt;,
+      &quot;startsAt&quot;: &quot;&lt;rfc3339&gt;&quot;,
+      &quot;endsAt&quot;: &quot;&lt;rfc3339&gt;&quot;,
+      &quot;generatorURL&quot;: &lt;string&gt; // identifies the entity that caused the alert
+    },
+    ...
+  ]
+}
+</code></pre>
+<h3 id="四-代码实现和配置">四. 代码实现和配置</h3>
+<h4 id="1-代码">1. 代码</h4>
+<p>使用python flask 去做webhook扩展，当kafka lag堆积，alertmanager触发webhook，发送post请求到flask。</p>
+<pre><code class="language-python">#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+from flask import Flask, request, jsonify
+import json
+
+import subprocess
+import logging
+
+
+logging.basicConfig(level=logging.DEBUG,
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('prometheus-webhook')
+
+def delete_pod():
+    try:
+        logger.info(&quot;/usr/bin/kubectl delete po -l backend=pod-labels&quot;)
+        p = subprocess.Popen(
+            [&quot;export KUBECONFIG=~/.kube/config &amp;&amp; /usr/local/bin/kubectl delete po -l backend=pod-labels&quot;], \
+                             stdout=subprocess.PIPE, shell=True)
+        outs, errs = p.communicate()
+        logger.info(outs)
+    except Exception as e:
+        logger.info(e)
+
+
+app = Flask(__name__)
+
+@app.route('/delete/pod', methods=['POST'])
+def delete():
+    # TO DO
+    # 校验
+    try:
+        data = json.loads(request.get_data())
+        alerts = data['alerts']
+        logger.info(alerts)
+        for i in alerts:
+            if i['labels']['consumergroup'] == 'kafka-user-notification-group' \
+                    and i['status'] == 'firing':
+                delete_pod()
+                response = {&quot;status&quot;: &quot;succeed&quot;}
+                logger.info(&quot;delete kafka-user-notification-group pod&quot;)
+            else:
+                logger.info(&quot;kafka-user-notification-group alert's status has resolved&quot;)
+                response = {&quot;status&quot;: &quot;succeed&quot;}
+    except Exception as e:
+        logger.info(e)
+        response = {&quot;status&quot;: &quot;failure&quot;}
+
+    return jsonify(response)
+
+if __name__ == '__main__':
+
+    app.run(host='0.0.0.0', port=8081)
+
+</code></pre>
+<h4 id="2-alertmanager配置">2. alertmanager配置</h4>
+<pre><code>  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname']
+      group_wait: 30s
+      group_interval: 1m
+      repeat_interval: 1h
+      receiver: 'alert'
+      routes:
+      - match:
+          severity: 'critical'
+          consumergroup: 'kafka-user-your-group'
+        receiver: 'webhook'
+        continue: true  # 设置为true，除了触发webhook之外还继续发出告警
+   receivers:
+      - name: 'webhook'
+        webhook_configs:
+        - url: 'http://host:8081/delete/pod'
+          send_resolved: true
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Prometheus全面监控kafka集群]]></title>
+        <id>https://moruikang.github.io/post/prometheus-quan-mian-jian-kong-kafka-ji-qun</id>
+        <link href="https://moruikang.github.io/post/prometheus-quan-mian-jian-kong-kafka-ji-qun">
+        </link>
+        <updated>2020-01-02T11:57:28.000Z</updated>
+        <content type="html"><![CDATA[<!-- more -->
+<h3 id="一-简介">一. 简介</h3>
+<p>网上看到很多使用Prometheus监控kafka集群的文章，但大多都不够详细，思来想去还是自己写一篇。<br>
+一般经验法则是：“收集所有可能/合理的指标，这些指标在故障排除时会有所帮助”。</p>
+<h4 id="如何使用prometheus监控kafka">如何使用Prometheus监控kafka？</h4>
+<p>kafka的组件如图：<br>
+<img src="https://moruikang.github.io/post-images/1577968463210.png" alt=""></p>
+<p>我们这里把kafka监控分成三大类：</p>
+<ul>
+<li>node exporter：broker系统指标</li>
+<li>JMX exporter: JMX指标</li>
+<li>kafka exporter：生产者/消费者指标</li>
+</ul>
+<h3 id="二-部署监控">二. 部署监控</h3>
+<h4 id="21-部署node-exporter监控系统级指标">2.1 部署node exporter，监控系统级指标</h4>
+<p>安装 <a href="https://github.com/prometheus/node_exporter/releases">node_exporter</a></p>
+<pre><code>$ sudo useradd --no-create-home --shell /bin/false node_exporter
+$ curl -fsSL https://github.com/prometheus/node_exporter/releases/download/v0.17.0/node_exporter-0.17.0.linux-amd64.tar.gz \
+  | sudo tar -zxvf - -C /usr/local/bin --strip-components=1 node_exporter-0.17.0.linux-amd64/node_exporter \
+  &amp;&amp; sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+$ sudo tee /etc/systemd/system/node_exporter.service &lt;&lt;&quot;EOF&quot;
+[Unit]
+Description=Node Exporter
+
+[Service]
+User=node_exporter
+Group=node_exporter
+EnvironmentFile=-/etc/sysconfig/node_exporter
+ExecStart=/usr/local/bin/node_exporter $OPTIONS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$ sudo systemctl daemon-reload &amp;&amp; \
+sudo systemctl start node_exporter &amp;&amp; \
+sudo systemctl status node_exporter &amp;&amp; \
+sudo systemctl enable node_exporter
+$ curl localhost:9100/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-cluster'
+    static_configs:
+      - targets: ['192.168.2.xx:9100']
+      - targets: ['192.168.2.xx:9100']
+      - targets: ['192.168.2.xx:9100']
+</code></pre>
+<p>推荐使用的<a href="https://github.com/moruikang/prometheus-grafana/tree/master/Kubernetes-nodes">Grafana node dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1578040237678.jpg" alt=""></p>
+<p>主机指标</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">Metrics</th>
+<th style="text-align:right">说明</th>
+<th style="text-align:right">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left">内存使用率</td>
+<td style="text-align:right">Kafka完全在RAM上运行。JVM内存设置大小不应大于可用的RAM。</td>
+<td style="text-align:right">&gt;85%</td>
+</tr>
+<tr>
+<td style="text-align:left">Swap使用率</td>
+<td style="text-align:right">注意Swap使用情况，内存不足时kafka会使用Swap,但它会降低Kafka的性能并导致操作超时</td>
+<td style="text-align:right">swap&gt; 128M</td>
+</tr>
+<tr>
+<td style="text-align:left">网络带宽</td>
+<td style="text-align:right">Kafka服务器依赖网络带宽。需要密切注意这一点，尤其是性能下降时。另外还要注意丢包率</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">磁盘使用率</td>
+<td style="text-align:right">确保随时都有足够的磁盘空间</td>
+<td style="text-align:right">&gt;85%</td>
+</tr>
+<tr>
+<td style="text-align:left">磁盘IO</td>
+<td style="text-align:right">Kafka中的磁盘是顺序的读写的</td>
+<td style="text-align:right">None</td>
+</tr>
+</tbody>
+</table>
+<h4 id="22-部署jmx-exporter监控jmx指标">2.2 部署jmx exporter，监控JMX指标</h4>
+<p>安装<a href="https://github.com/prometheus/jmx_exporter">jmx_exporter</a>到kafka安装目录(例如/opt/kafka_2.11-2.0.0)</p>
+<pre><code>$ wget https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/0.12.0/jmx_prometheus_javaagent-0.12.0.jar
+$ wget https://raw.githubusercontent.com/prometheus/jmx_exporter/master/example_configs/kafka-2_0_0.yml
+$ vim bin/kafka-server-start.sh
+#在文件开始处添加
+export KAFKA_OPTS=&quot;-javaagent:/opt/kafka_2.11-2.0.0/jmx_prometheus_javaagent-0.11.0.jar=9990:/opt/kafka_2.11-2.0.0/kafka-2_0_0.yml&quot;
+</code></pre>
+<p>重启kafka<br>
+验证指标:</p>
+<pre><code>$ curl localhost:9990/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-jmx-exporter'
+    static_configs:
+      - targets: ['192.168.2.xx:9990']
+      - targets: ['192.168.2.xx:9990']
+      - targets: ['192.168.2.xx:9990']
+</code></pre>
+<p>推荐使用的Grafana <a href="https://grafana.com/grafana/dashboards/721">kafka jmx exporter dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1578042096280.jpg" alt=""></p>
+<p>JMX指标：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">Metrics</th>
+<th style="text-align:right">说明</th>
+<th style="text-align:right">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left">kafka_server_replicamanager_underreplicatedpartitions</td>
+<td style="text-align:right">未复制的分区数</td>
+<td style="text-align:right">&gt;0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_controller_kafkacontroller_offlinepartitionscount</td>
+<td style="text-align:right">没有存活leader的分区数，这些分区不可读也不可写</td>
+<td style="text-align:right">&gt;0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_controller_kafkacontroller_activecontrollercount</td>
+<td style="text-align:right">存活的active controller brokers</td>
+<td style="text-align:right">!=1</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_server_brokertopicmetrics_messagesin_total</td>
+<td style="text-align:right">每秒传入的消息</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">bytesin_total/bytesout_total</td>
+<td style="text-align:right">每秒传入/传出字节</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">RequestsPerSec</td>
+<td style="text-align:right">{Produce/FetchConsumer/FetchFollower} - 每秒请求数</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">TotalTimeMs</td>
+<td style="text-align:right">{Produce/FetchConsumer/FetchFollower} – 处理一次请求时间</td>
+<td style="text-align:right">None</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_controller_controllerstats_uncleanleaderelections_total</td>
+<td style="text-align:right">有问题的leader选举次数</td>
+<td style="text-align:right">!=0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_server_replicamanager_partitioncount</td>
+<td style="text-align:right">集群的分区数</td>
+<td style="text-align:right">!= 你的分区数</td>
+</tr>
+<tr>
+<td style="text-align:left">isrshrinks / isrexpands</td>
+<td style="text-align:right">当broker崩溃时，partition的ISR将缩小。当broker恢复后，当replica全部同步数据后，分区的ISR将扩展。</td>
+<td style="text-align:right">!=0</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_network_socketserver_networkprocessoravgidlepercent</td>
+<td style="text-align:right">网络处理器的平均空闲时间</td>
+<td style="text-align:right">&lt; 0.3</td>
+</tr>
+<tr>
+<td style="text-align:left">kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent_count</td>
+<td style="text-align:right">处理请求线程的平均空闲时间</td>
+<td style="text-align:right">&lt; 0.3</td>
+</tr>
+<tr>
+<td style="text-align:left">jvm_memory_bytes_used</td>
+<td style="text-align:right">Java进程动态分配的内存</td>
+<td style="text-align:right">None</td>
+</tr>
+</tbody>
+</table>
+<h4 id="23-部署kafka-exporter监控消费者指标">2.3 部署kafka exporter，监控消费者指标</h4>
+<p>安装<a href="https://github.com/danielqsj/kafka_exporter/releases">kafka_exporter</a></p>
+<pre><code>$ sudo useradd --no-create-home --shell /bin/false kafka_exporter
+$ curl -fsSL https://github.com/danielqsj/kafka_exporter/releases/download/v1.2.0/kafka_exporter-1.2.0.linux-amd64.tar.gz | \
+sudo tar -zxvf - -C /usr/local/bin --strip-components=1 kafka_exporter-1.2.0.linux-amd64/kafka_exporter  &amp;&amp; \
+sudo chown kafka_exporter:kafka_exporter /usr/local/bin/kafka_exporter
+$ sudo tee /etc/systemd/system/kafka_exporter.service &lt;&lt;&quot;EOF&quot;
+[Unit]
+Description=Kafka Exporter
+
+[Service]
+User=kafka_exporter
+Group=kafka_exporter
+EnvironmentFile=-/etc/sysconfig/kafka_exporter
+ExecStart=/usr/local/bin/kafka_exporter $OPTIONS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$ sudo mkdir -p /etc/sysconfig &amp;&amp; sudo tee /etc/sysconfig/kafka_exporter &lt;&lt;&quot;EOF&quot;
+OPTIONS=&quot;--kafka.server=localhost:9092&quot; # kafka host:port
+EOF
+$ sudo systemctl daemon-reload &amp;&amp; \
+sudo systemctl start kafka_exporter &amp;&amp; \
+sudo systemctl status kafka_exporter &amp;&amp; \
+sudo systemctl enable kafka_exporter
+$ curl localhost:9308/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['192.168.2.xx:9308']
+</code></pre>
+<p>推荐使用的Grafana <a href="https://grafana.com/grafana/dashboards/7589">kafka exporter overview dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1578044648009.jpg" alt=""><br>
+kafka exporter指标：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">Metrics</th>
+<th style="text-align:right">说明</th>
+<th style="text-align:right">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left">kafka_consumergroup_lag</td>
+<td style="text-align:right">消费者落后于生产者的消息数</td>
+<td style="text-align:right">&gt; 20</td>
+</tr>
+</tbody>
+</table>
+<p>如果使用helm部署kafka exporter里可以考虑我自己简单写的<a href="https://github.com/moruikang/kafka-exporter-helm">helm chart</a><br>
+备注：最近发现 kafka exporter github作者出了自己的<a href="https://github.com/danielqsj/kafka_exporter/tree/master/charts/kafka-exporter">helm chart</a><br>
+建议使用官方的。</p>
+<h3 id="三-kafka黑盒监控">三. kafka黑盒监控</h3>
+<p>在集群上建立一个专门的topic, 监控程序实时的写入数据, 当无法写入或写入耗时达到阈值时报警, 基本上都第一时间发现问题。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[使用Kops和Terraform在AWS部署Kubernetes高可用集群]]></title>
+        <id>https://moruikang.github.io/post/shi-yong-kops-he-terraform-zai-aws-bu-shu-kubernetes-gao-ke-yong-ji-qun</id>
+        <link href="https://moruikang.github.io/post/shi-yong-kops-he-terraform-zai-aws-bu-shu-kubernetes-gao-ke-yong-ji-qun">
+        </link>
+        <updated>2020-01-01T07:04:31.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一介绍">一.介绍</h2>
+<p><a href="https://github.com/kubernetes/kops">Kops</a>是一个命令行工具，可用于在AWS上部署符合生产要求的Kubernetes集群。它具有创建跨越多个可用性区域的高可用性群集的能力，并支持专用网络拓扑。默认情况下，Kops将在AWS建立kubernetes所有需要的资源EC2，VPC和子网，并在Route53添加DNS解析记录，使用AWS负载平衡器(ELB)暴露Kubernetes API，和其他需要的基础设施组件。<br>
+<a href="https://www.terraform.io/">Terraform</a>是用来管理云上基础架构的工具，它的理念是基础设施即代码，使用代码来配置和管理任何云资源</p>
+<h2 id="二架构">二.架构</h2>
+<figure data-type="image" tabindex="1"><img src="https://moruikang.github.io/post-images/1577866310038.jpg" alt=""></figure>
+<h2 id="三创建集群">三.创建集群</h2>
+<h4 id="提前准备">提前准备</h4>
+<ul>
+<li>AWS Administrator account</li>
+<li>GoDaddy账号</li>
+</ul>
+<h4 id="1-创建aws-iamroute53">1. 创建AWS IAM，Route53</h4>
+<p>相见Kops<a href="https://github.com/kubernetes/kops/blob/v1.10.0/docs/aws.md">文档</a><br>
+1.1 创建IAM用户<br>
+为了在AWS内构建集群，需要创建一个专用的IAM用户kops。这个用户需要API凭据才能使用kops。使用AWS控制台创建用户并下载ACCESS KEY和SECRET凭证(请自行在AWS IAM控制台执行创建操作)。<br>
+这个kops用户需要以下IAM权限：</p>
+<pre><code>AmazonEC2FullAccess
+AmazonRoute53FullAccess
+AmazonS3FullAccess
+IAMFullAccess
+AmazonVPCFullAccess
+</code></pre>
+<p>创建kops用户并下载ACCESS KEY和SECRET凭证后<br>
+执行</p>
+<pre><code># 使用上一步保存的ACCESS KEY和SECRET，配置aws cli 
+$ aws configure
+$ export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+$ export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+</code></pre>
+<p>1.2 配置Route 53<br>
+为什么需要操作这一步？<br>
+因为kops创建k8s集群需要一个域名，这个域名的ns(namespace)托管在Route53后，Kops可以在AWS可以创建一些子域名分别指向不同应用服务</p>
+<pre><code>api.internal.xxx.com =&gt; k8s master
+etcd-x.internal.xxx.com =&gt; etcd 
+api.xxx.com =&gt; k8s api-server
+bastion.xxx.com =&gt; k8s bastion
+...
+</code></pre>
+<p>创建AWS Route53托管区域</p>
+<pre><code># subdomain.example.com是你在godaddy(或者别的域名商)的域名
+$ ID=$(uuidgen) &amp;&amp; aws route53 create-hosted-zone --name subdomain.example.com --caller-reference $ID | \
+    jq .DelegationSet.NameServers
+</code></pre>
+<p>生成:<br>
+<img src="https://moruikang.github.io/post-images/1578309303493.jpg" alt=""></p>
+<p>记录下来 AWS Route53托管区域ID 下一步会需要到</p>
+<pre><code>$ aws route53 list-hosted-zones | jq '.HostedZones[] | select(.Name==&quot;example.com.&quot;) | .Id'
+# 输出结果类似以下内容:
+{
+  &quot;Comment&quot;: &quot;Create a subdomain NS record in the parent domain&quot;,
+  &quot;Changes&quot;: [
+    {
+      &quot;Action&quot;: &quot;CREATE&quot;,
+      &quot;ResourceRecordSet&quot;: {
+        &quot;Name&quot;: &quot;subdomain.example.com&quot;,
+        &quot;Type&quot;: &quot;NS&quot;,
+        &quot;TTL&quot;: 300,
+        &quot;ResourceRecords&quot;: [
+          {
+            &quot;Value&quot;: &quot;ns-1.awsdns-1.co.uk&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-2.awsdns-2.org&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-3.awsdns-3.com&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-4.awsdns-4.net&quot;
+          }
+        ]
+      }
+    }
+  ]
+}
+</code></pre>
+<p>最后在godaddy那边对该域名添加以上4条ns记录(value字段的4条内容)<br>
+本地验证ns是否生效</p>
+<pre><code>$ dig NS subdomain.example.com +short
+#输出结果应该为以上添加的4条ns记录
+
+</code></pre>
+<h4 id="2-创建vpc网络和kubernetes集群">2. 创建VPC网络和kubernetes集群</h4>
+<pre><code>$ git clone https://github.com/ryane/kubernetes-aws-vpc-kops-terraform.git
+$ cd kubernetes-aws-vpc-kops-terraform
+$ export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+$ export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+
+#创建terraform集群配置
+$ cat &lt;&lt;EOF  &gt; subdomain.example.com.tfvars
+name=&quot;example.com&quot;
+region=&quot;ap-southeast-1&quot; 
+azs=[&quot;ap-southeast-1a&quot;,&quot;ap-southeast-1b&quot;,&quot;ap-southeast-1c&quot;]
+env=&quot;prod&quot;
+vpc_cidr=&quot;10.3.0.0/16&quot;
+EOF
+$ ls
+README.md   main.tf   outputs.tf    subdomain.example.com.tfvars variables.tf   gensubnets  modules override.tf update-zone.json
+</code></pre>
+<p>可以看到，这里都是项目的terraform代码。<br>
+一切准备妥当，可以开始创建vpc了</p>
+<pre><code>$ terraform init  # 初始化代码，下载依赖包国内网络会有点久，翻墙好点
+$ terraform plan -var-file=subdomain.example.com.tfvars  #建议所有操作有预执行一遍
+$ terraform apply -var-file=subdomain.example.com.tfvars -auto-approve
+</code></pre>
+<p>完成创建VPC， 去到AWS VPC控制台，会看到创建的VPC,6个子网，4个路由表，3个私网的NAT网关等等<br>
+下一步开始我们的主题，创建kubernetes集群</p>
+<pre><code>$ export NAME=$(terraform output cluster_name)
+$ export KOPS_STATE_STORE=$(terraform output state_store)
+$ export ZONES=$(terraform output -json availability_zones | jq -r '.value|join(&quot;,&quot;)')
+$ export MASTER_SIZE=${MASTER_SIZE:-m5.large}
+$ export NODE_SIZE=${NODE_SIZE:-m5.xlarge}
+
+$ kops create cluster \
+    --associate-public-ip=false \
+    --bastion \
+    --master-count 3 \
+    --master-size $MASTER_SIZE \
+    --master-zones $ZONES \
+    --zones $ZONES \
+    --topology private \
+    --dns-zone Z25xxxxxxxx4U6 \  #这里输入前面route53生成的托管区域id
+    --networking amazon-vpc-routed-eni \  # 选择aws提供的k8s cni
+    --network-cidr 10.3.0.0/16 \
+    --node-count 1 \
+    --node-size $NODE_SIZE \
+    --vpc $(terraform output vpc_id) \
+    --ssh-access 0.0.0.0/0 \  #建议输入你的本地公网ip地址
+    --target=terraform \
+    --out=. \
+    ${NAME}
+
+# 导出子网设置,记录下来，后续需要修改cluster子网设置
+$ terraform output -json | docker run --rm -i ryane/gensubnets:0.1
+# 把以上输出子网信息复制下来
+$ kops get cluster ${NAME} -o yaml &gt; cluster.yaml  #备份集群yaml
+$ kops edit cluster ${NAME}
+# 修改前的子网部分应该类似如下：
+subnets:
+- cidr: 10.20.32.0/19
+  name: us-east-1a
+  type: Private
+  zone: us-east-1a
+- cidr: 10.20.64.0/19
+  name: us-east-1c
+  type: Private
+  zone: us-east-1c
+- cidr: 10.20.96.0/19
+  name: us-east-1d
+  type: Private
+  zone: us-east-1d
+- cidr: 10.20.0.0/22
+  name: utility-us-east-1a
+  type: Utility
+  zone: us-east-1a
+- cidr: 10.20.4.0/22
+  name: utility-us-east-1c
+  type: Utility
+  zone: us-east-1c
+- cidr: 10.20.8.0/22
+  name: utility-us-east-1d
+  type: Utility
+  zone: us-east-1d
+#使用前一步的子网输出信息，替换*subnets* 模块里的子网内容，替换后应该类似如下：
+subnets:
+- egress: nat-0b2f7f77b15041515
+  id: subnet-8db395d6
+  name: us-east-1a
+  type: Private
+  zone: us-east-1a
+- egress: nat-059d239e3f86f6da9
+  id: subnet-fd6b41d0
+  name: us-east-1c
+  type: Private
+  zone: us-east-1c
+- egress: nat-0231eef9a93386f4a
+  id: subnet-5fc6dd16
+  name: us-east-1d
+  type: Private
+  zone: us-east-1d
+- id: subnet-0ab39551
+  name: utility-us-east-1a
+  type: Utility
+  zone: us-east-1a
+- id: subnet-656b4148
+  name: utility-us-east-1c
+  type: Utility
+  zone: us-east-1c
+- id: subnet-cdc7dc84
+  name: utility-us-east-1d
+  type: Utility
+  zone: us-east-1d
+# 更新修改
+$ kops update cluster \
+  --out=. \
+  --target=terraform \
+  ${NAME}
+$ terraform plan -var-file=subdomain.example.com.tfvars
+$ terraform apply -var-file=subdomain.example.com.tfvars -auto-approve
+</code></pre>
+<p>这样子，整个k8s集群都部署完成。<br>
+kubeconfig自动生成在你本地~/.kube/config， bastion节点的登陆私钥默认是~/.ssh/id_rsa(kops创建集群的时候可以使用--ssh-public-key参数指定公钥)</p>
+<pre><code>$ kops get instancegroups
+NAME                    ROLE    MACHINETYPE     MIN     MAX     ZONES
+bastions                Bastion t2.micro        1       1       ap-southeast-1a
+master-ap-southeast-1a  Master  m5.xlarge       1       1       ap-southeast-1a
+master-ap-southeast-1b  Master  m5.xlarge       1       1       ap-southeast-1b
+master-ap-southeast-1c  Master  m5.xlarge       1       1       ap-southeast-1c
+nodes                   Node    m5.xlarge       3       20      ap-southeast-1a,ap-southeast-1b,ap-southeast-1c
+</code></pre>
+<p>切换到aws Route53控制台，可以发现有2条对外的域名，分别是:<br>
+api.subdomain.example.com(dns指向bastion节点的Load Balancer，查看kubeconfig内容，该域名即为apiserver)<br>
+bastion.subdomain.example.com(dns指向k8s master节点的Load Balancer）<br>
+修改这两个域名的访问ip控制，可从对应的Load Balancer安全组修改。</p>
+<p>切换到AWS S3控制台信息，可以看到多了一个S3 bucket， 这个S3 Bucket是用来存储kops k8s集群信息的。<br>
+切换到AWS EC2控制台，发现auto scaling多了5个组，分别对应kops get instancegroups的内容。<br>
+切换到AWS IAM，发现kops为每一个instancegroup都创建了对应的role角色权限。<br>
+清除所有基础资源</p>
+<pre><code>$ terraform destroy
+</code></pre>
+<p>建议:</p>
+<ol>
+<li>以后所有的基础资源改动，都经过terraform，不需要手动在AWS控制台修改，否则下次terraform执行引起冲突</li>
+<li>对于k8s集群，如果需要扩大集群节点的CIDR块，在创建集群前，可修改代码里的(位置：modules/subnet-pair/variables.tf）<a href="https://www.terraform.io/docs/configuration/functions/cidrsubnet.html">newbits</a>，默认是8，改小可以扩大CIDR块。</li>
+</ol>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[生产环境kafka集群的搭建]]></title>
+        <id>https://moruikang.github.io/post/kafka-ji-qun-de-da-jian-yu-wei-hu</id>
+        <link href="https://moruikang.github.io/post/kafka-ji-qun-de-da-jian-yu-wei-hu">
+        </link>
+        <updated>2019-12-31T18:00:53.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一kafka介绍">一.kafka介绍</h2>
+<h4 id="kafka是由apache软件基金会开发的一个开源流处理平台由scala和java编写-该项目的目标是为处理实时数据提供一个统一-高吞吐-低延迟的平台">Kafka是由Apache软件基金会开发的一个开源流处理平台，由Scala和Java编写。该项目的目标是为处理实时数据提供一个统一、高吞吐、低延迟的平台。</h4>
+<h3 id="特点">特点</h3>
+<ul>
+<li>顺序读写磁盘，高吞吐量</li>
+<li>本地持久化消息</li>
+<li>分布式消息系统</li>
+</ul>
+<h3 id="架构">架构</h3>
+<p><img src="https://moruikang.github.io/post-images/1577710975402.png" alt=""><br>
+Kafka架构的主要术语包括Producer、 Consumer、Topic、Partition和Broker。</p>
+<ul>
+<li>Producer: 负责发布消息到Kafka broker</li>
+<li>Consumer、ConsumerGroup: Consumer是消息消费者，向Kafka broker读取消息的客户端，每个Consumer属于一个特定的Consumer Group（可为每个Consumer指定group name，若不指定group name则属于默认的group）</li>
+<li>Topic: 用来对消息进行分类，每个进入到Kafka的信息都会被放到一个Topic下</li>
+<li>Partition: 每个Topic中的消息会被分为一个或多个Partition<br>
+<img src="https://moruikang.github.io/post-images/1577711957585.webp" alt=""></li>
+<li>Broker: 用来实现数据存储的主机服务器</li>
+</ul>
+<p>Kafka中发布订阅的对象是topic。我们可以为每类数据创建一个topic；向topic发布消息的客户端称作producer，从topic订阅消息的客户端称作consumer。Producers和consumers可以同时从多个topic读写数据。一个kafka集群由一个或多个broker服务器组成，它负责持久化和备份kafka消息。</p>
+<h2 id="二部署">二.部署</h2>
+<h3 id="1部署服务器节点">1.部署服务器节点</h3>
+<p><img src="https://moruikang.github.io/post-images/1577712041184.jpg" alt=""><br>
+服务器环境</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:left">节点</th>
+<th style="text-align:right">ip</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left">node3</td>
+<td style="text-align:right">192.168.2.43</td>
+</tr>
+<tr>
+<td style="text-align:left">node2</td>
+<td style="text-align:right">192.168.2.44</td>
+</tr>
+<tr>
+<td style="text-align:left">node3</td>
+<td style="text-align:right">192.168.2.45</td>
+</tr>
+</tbody>
+</table>
+<p>系统和依赖：</p>
+<ul>
+<li>ubuntu 18.04</li>
+<li>java openjdk version &quot;1.8.0_222&quot; (自行安装)</li>
+</ul>
+<h3 id="2安装zookeeper">2.安装zookeeper</h3>
+<p>node1,node2,node3都要下载和安装<br>
+下载版本： https://archive.apache.org/dist/zookeeper/zookeeper-3.4.12/</p>
+<pre><code>$ cd /opt
+$ wget https://archive.apache.org/dist/zookeeper/zookeeper-3.4.12/zookeeper-3.4.12.tar.gz
+$ tar -zxvf  zookeeper-3.4.12.tar.gz
+$ cd zookeeper-3.4.12
+修改配置：
+$ vim conf/zoo.cfg 
+tickTime=2000
+initLimit=10
+syncLimit=5
+dataDir=/opt/zookeeper-3.4.12/data    ###根据实际情况修改
+dataLogDir=/opt/zookeeper-3.4.12/log  ###根据实际情况修改
+clientPort=2181
+server.1=192.168.2.43:2888:3888
+server.2=192.168.2.44:2888:3888
+server.3=192.168.2.45:2888:3888
+#server.1 这个1是服务器的标识也可以是其他的数字， 表示这个是第几号服务器，用来标识服务器，这个标识要写到快照目录下面myid文件里
+#192.168.2.43-45为集群里的IP地址，第一个端口是master和slave之间的通信端口，默认是2888，第二个端口是leader选举的端口，集群刚启动的时候选举或者leader挂掉之后进行重新选举的端口，默认是3888
+</code></pre>
+<h4 id="21-配置文件解释">2.1 配置文件解释：</h4>
+<p>#tickTime：<br>
+这个时间是作为Zookeeper服务器之间或客户端与服务器之间维持心跳的时间间隔，也就是每间隔 tickTime时间就会发送一个心跳。<br>
+#initLimit：<br>
+这个配置项是用来配置Zookeeper接受客户端（这里所说的客户端不是用户连接Zookeeper服务器的客户端，而是Zookeeper服务器集群中连接到Leader的Follower服务器）初始化连接时最长能忍受多少个心跳时间间隔数。当已经超过5个心跳的时间（也就是tickTime）长度后，Zookeeper服务器还没有收到客户端的返回信息，那么表明这个客户端连接失败。总的时间长度等于5<em>2000=10秒<br>
+#syncLimit：<br>
+这个配置项标识Leader与Follower之间发送消息，请求和应答时间长度，最长不能超过多少个tickTime的时间长度，总的时间长度就是5</em>2000=10秒<br>
+#dataDir：<br>
+快照日志的存储路径<br>
+#dataLogDir：<br>
+事务日志的存储路径，如果不配置这个，那么事务日志会默认存储到dataDir指定的目录，这会严重影响zk的性能，当zk吞吐量较大的时候，产生的事务日志、快照日志会很多。<br>
+#clientPort：<br>
+客户端连接Zookeeper服务器的端口，Zookeeper监听这个端口，接受客户端的访问请求。</p>
+<pre><code>#node1
+$ echo &quot;1&quot; &gt; /opt/zookeeper-3.4.12/data/myid 
+#node2
+$ echo &quot;2&quot; &gt; /opt/zookeeper-3.4.12/data/myid 
+#node3
+$ echo &quot;3&quot; &gt; /opt/zookeeper-3.4.12/data/myid 
+</code></pre>
+<p>创建zookerper.service的systemd系统守护进程<br>
+node1,node2,node3都需要操作</p>
+<pre><code>$ tee zookeeper.service &gt; /dev/null &lt;&lt;EOF
+[Unit]
+Description=ZooKeeper Service
+Documentation=http://zookeeper.apache.org
+Requires=network.target
+After=network.target
+[Service]
+Type=forking
+User=ubuntu
+Group=ubuntu
+ExecStart=/opt/zookeeper-3.4.12/bin/zkServer.sh start 
+ExecStop=/opt/zookeeper-3.4.12/bin/zkServer.sh stop 
+ExecReload=/opt/zookeeper-3.4.12/bin/zkServer.sh restart
+WorkingDirectory=/var/log/zookeeper
+EOF
+$ cp zookeeper.service  /etc/systemd/system/zookeeper.service
+$ systemctl enable zookeeper.service
+$ systemctl start zookeeper.service 
+$ systemctl status zookeeper.service 
+</code></pre>
+<pre><code>#进入到Zookeeper的bin目录下 （3台都需要操作）
+$ cd /opt/zookeeper-3.4.12/bin
+#检查服务状态 
+$ ./zkServer.sh status
+</code></pre>
+<h3 id="3-安装kafka">3. 安装kafka</h3>
+<h4 id="31-创建目录并下载安装软件">3.1 创建目录并下载安装软件</h4>
+<p>#安装目录</p>
+<pre><code>$ cd /opt
+#下载软件
+$ wget http://mirror.bit.edu.cn/apache/kafka/2.1.1/kafka_2.11-2.1.1.tgz #解压软件
+$ tar -zxvf kafka_2.11-2.1.1.tgz
+</code></pre>
+<h4 id="32-修改配置文件">3.2 修改配置文件</h4>
+<p>进入到config目录</p>
+<pre><code>$ cd /opt/kafka_2.11-2.1.1/config
+$ vim server.properties   
+broker.id=0 #当前机器在集群中的唯一标识，和zookeeper的myid性质一样，建议node1为0，node2为1，node3为2
+listeners=PLAINTEXT://192.168.2.43:9092 #kafka监听地址，根据本机ip填写
+num.network.threads=5 # borker进行网络处理的线程数,建议不大于CPU的2倍
+num.io.threads=10  # borker进行I/O处理的线程数
+socket.send.buffer.bytes=102400 #发送缓冲区buffer大小，数据不是一下子就发送的，先回存储到缓冲区了到达一定的大小后再发送，能提高性能
+socket.receive.buffer.bytes=102400 #kafka接收缓冲区大小，当数据到达一定大小后再序列化到磁盘
+socket.request.max.bytes=104857600 #向kafka请求消息或者向kafka发送消息的最大请求数，这个值不能超过java的堆栈大小
+log.dirs=/data/kafka-logs #消息存放的目录，多个目录使用&quot;,&quot;逗号分割，上面num.io.threads要大于目录的个数；如果配置多个目录，新创建的topic把消息持久化在当前目录列表中分区数最少的那个目录。
+num.partitions=6 #默认的分区数，默认1个分区数
+num.recovery.threads.per.data.dir=1
+log.retention.hours=168 #默认消息的最大持久化时间，168小时，7天
+log.segment.bytes=1073741824 #kafka的消息是以追加的形式存储到文件，当超过这个值的时候，kafka会新起一个文件
+log.retention.check.interval.ms=300000 #每隔300000毫秒去检查上面配置的log失效时间（log.retention.hours=168 ），到目录查看是否有过期的消息，如果有，删除
+offsets.topic.replication.factor=3 #kafka会把offset信息存在这个topic里面，当是集群部署时，这个副本数等于节点数
+zookeeper.connect=192.168.2.43:2181,192.168.2.44:2181,192.168.2.45:2181#设置zookeeper的连接端口
+message.max.byte=5242880
+default.replication.factor=3
+replica.fetch.max.bytes=5242880
+zookeeper.connection.timeout.ms=6000 #连接zookeeper的超时时间 
+auto.leader.rebalance.enable=true
+</code></pre>
+<p>创建zookerper.service的systemd系统守护进程<br>
+node1,node2,node3都需要操作</p>
+<pre><code>$ tee kafkals.service &gt; /dev/null &lt;&lt;EOF
+[Unit]
+Description=Apache Kafka server (broker)
+Documentation=http://kafka.apache.org/documentation.html
+Requires=network.target remote-fs.target
+After=network.target remote-fs.target zookeeper.service
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+ExecStart=/opt/kafka_2.11-2.1.1/bin/kafka-server-start.sh /opt/kafka_2.11-2.1.1/config/server.properties
+ExecStop=/opt/kafka_2.11-2.1.1/bin/kafka-server-stop.sh
+WorkingDirectory=/var/log/kafka
+[Install]
+WantedBy=multi-user.target
+EOF
+$ cp kafka.service  /etc/systemd/system/kafka.service
+$ systemctl enable kafka.service
+$ systemctl start kafka.service 
+$ systemctl status kafka.service 
+</code></pre>
+<h4 id="33-创建topic来验证是否创建成功">3.3 创建Topic来验证是否创建成功</h4>
+<pre><code>#创建Topic
+$ cd /opt/kafka_2.11-2.1.1/bin
+$ kafka-topics.sh --create --zookeeper 192.168.2.43:2181 --replication-factor 3 --partitions 6 --topic test
+#解释 --replication-factor 3 复制两份; --partitions 6 创建6个分区; --topic 主题为test 
+#在一台服务器上创建发布者
+$ kafka-console-producer.sh --broker-list 192.168.2.43:9092 --topic test   ###从这里输入发送的消息 
+</code></pre>
+<pre><code>#新开一个终端，创建一个消费者，接收消息
+kafka-console-consumer.sh --zookeeper 192.168.2.43:2181 --topic test --from-beginning
+</code></pre>
+<p>上面的完成之后可以登录zk来查看zk的目录情况</p>
+<pre><code>#使用客户端进入
+cd /opt/zookeeper-3.4.12/bin ./zkCli.sh 
+#查看目录情况 执行
+[zk: 192.168.2.43:2181(CONNECTED) 1] ls /  #查看目录
+[zk: 192.168.2.43:2181(CONNECTED) 1] get /brokers/ids/0 #查看broker
+</code></pre>
+<h4 id="34-日志说明">3.4 日志说明</h4>
+<p>默认kafka的日志保存在/opt/kafka/kafka_2.12-0.10.2.1/logs目录下，这里说几个需要注意的日志</p>
+<p>server.log #kafka的运行日志<br>
+state-change.log  #kafka用zookeeper来保存状态，有可能会进行切换，切换的日志就保存在这里<br>
+controller.log #kafka选择一个节点作为“controller”,当发现有节点down掉的时候它负责在可用分区的所有节点中选择新的leader,这使得Kafka可以批量高效的管理所有分区节点的主从关系。如果controller down掉了，活着的节点中的一个会被切换为新的controller.</p>
+<h2 id="三-建议">三. 建议</h2>
+<h4 id="31-kafka和zookeeper分开部署在单独节点cpu选择io优化给足够的带宽">3.1 kafka和zookeeper分开部署在单独节点，CPU选择IO优化，给足够的带宽</h4>
+<h4 id="32-kafka是io类型建议挂多块磁盘给不同partition">3.2 kafka是IO类型，建议挂多块磁盘给不同partition</h4>
+<h4 id="33-partition分区数根据消费者来定">3.3 partition分区数根据消费者来定</h4>
+<h4 id="34-根据需求修改zookeeper和kafka-jvm参数">3.4 根据需求修改zookeeper和kafka jvm参数</h4>
+<h4 id="35-做好kafka监控特别关注lag指标">3.5 做好kafka监控，特别关注lag指标</h4>
 ]]></content>
     </entry>
 </feed>
