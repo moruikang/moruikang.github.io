@@ -1,0 +1,1969 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+    <id>https://moruikang.github.io</id>
+    <title>Gridea</title>
+    <updated>2025-12-23T06:09:00.898Z</updated>
+    <generator>https://github.com/jpmonette/feed</generator>
+    <link rel="alternate" href="https://moruikang.github.io"/>
+    <link rel="self" href="https://moruikang.github.io/atom.xml"/>
+    <subtitle>日常成长提炼</subtitle>
+    <logo>https://moruikang.github.io/images/avatar.png</logo>
+    <icon>https://moruikang.github.io/favicon.ico</icon>
+    <rights>All rights reserved 2025, Gridea</rights>
+    <entry>
+        <title type="html"><![CDATA[python实现简单的DAG任务工作流]]></title>
+        <id>https://moruikang.github.io/post/python-shi-xian-de-jian-dan-ren-wu-gong-zuo-liu/</id>
+        <link href="https://moruikang.github.io/post/python-shi-xian-de-jian-dan-ren-wu-gong-zuo-liu/">
+        </link>
+        <updated>2024-11-01T15:04:50.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="背景">背景</h2>
+<p>近期完成了一个基于Python的电芯生产数据分析项目。该项目需要针对现有Doris宽表中的业务参数数据，创建多个批次组之间的实验组与对照组分析任务。数据规模庞大——每个批次包含几万到数百万根电芯，每根电芯在生产过程中会产生一百多个参数值。比如我有2个实验组批次 vs 2个对照组批次，每个批次10w个电芯，那么我的全部参数值数据量为：4 * 100000 * 100 = 4亿个参数值，对应到宽表里则是4亿条记录。</p>
+<p>在分析流程中，我们首先需要根据分析组（实验组或对照组）从数据库中查询各电芯批次的参数数据，随后使用numpy、pandas为每个电芯批次分别计算各个参数的1/4分位数（Q1）、中位数、3/4分位数（Q3）、均值、方差等统计特征值，并将这些特征值记录到中间过程表中。这一阶段我们称之为 “<strong>求特征值任务</strong>”阶段，由于其涉及大量数据库读写操作，属于典型的<strong>IO密集型任务</strong>。</p>
+<p>紧接着，系统会加载中间过程表中的特征值数据，并运用预设的判异规则，对实验组与对照组中的电芯批次进行两两比较与判异分析。此阶段称为 “<strong>判异任务</strong>”阶段，因其以数值计算和规则判断为主，属于<strong>计算密集型任务</strong>。</p>
+<p>为快速完成初版迭代，我们第一版本采用单线程模型实现了基本业务逻辑。随后，为进一步提升代码可维护性与执行效率，我们对业务流程进行了梳理（具体流程见下图），发现该业务场景实际上构成了一个有向无环图（DAG）。基于这一认识，我们决定采用工作流思想，结合线程池技术对代码进行优化与加速。</p>
+<p>具体的业务流程见下图：<br>
+<img src="https://moruikang.github.io/post-images/1756818768930.png" alt="" loading="lazy"></p>
+<h2 id="系统设计与实现">系统设计与实现</h2>
+<h3 id="1-任务单元封装task类">1、任务单元封装：Task类</h3>
+<p>我们首先对任务单元进行了抽象封装，定义Task类作为所有任务执行的代理单元。每个Task实例包含任务名称、实际执行函数及其依赖的前置任务列表。此外，我们还引入了线程安全的停止标志机制，以支持任务执行过程中的优雅中断。</p>
+<pre><code># task.py
+import threading
+from typing import Callable, List, Optional
+
+class Task:
+    &quot;&quot;&quot;
+    用于封装代理，执行真正的任务
+    &quot;&quot;&quot;
+    def __init__(
+        self,
+        name: str,
+        func: Callable[[threading.Event], Optional[str]],
+        dependencies: Optional[List[str]] = None,
+    ):
+        self.name: str = name  # 任务名称
+        self.func: Callable[[threading.Event], Optional[str]] = func  # 任务执行的函数
+        self.dependencies: List[str] = dependencies or []  # 前置任务
+        self.result: Optional[str] = None  # 执行结果
+
+    def run(self, stop_execution: threading.Event) -&gt; Optional[str]:
+        &quot;&quot;&quot;
+        执行任务。如果终止标志被设置，则跳过任务执行。
+        &quot;&quot;&quot;
+        if stop_execution.is_set():
+            print(f&quot;Skipping task: {self.name} due to stop signal.&quot;)
+            return None
+        print(f&quot;Starting task: {self.name}&quot;)
+        self.result = self.func(stop_execution)  # 传入停止标志
+        print(f&quot;Completed task: {self.name}&quot;)
+        return self.result
+</code></pre>
+<h4 id="设计说明">设计说明：</h4>
+<ul>
+<li><strong>停止标志传递</strong>：通过threading.Event实现跨线程的中断信号传递，确保任一任务失败时能及时终止整个流程。</li>
+<li><strong>依赖管理</strong>：通过dependencies列表明确任务间的执行顺序关系，为后续DAG调度奠定基础。</li>
+<li><strong>结果缓存</strong>：每个任务执行结果存储在result属性中，供依赖此任务的其他任务访问。</li>
+</ul>
+<h3 id="2-dag构建与任务拆解dag类">2、DAG构建与任务拆解：Dag类</h3>
+<p>Dag类负责从数据库获取参数配置，并根据参数间的父子关系拆解为特征值计算和判异分析两类任务，构建完整的DAG结构。</p>
+<pre><code># dag.py
+import threading
+import time
+from typing import List, Optional
+from models import ParameterModel
+from task import Task
+class Dag(object):
+
+    def __init__(self, task_code = None):
+        self.task_code = task_code
+        self.parameters = self.get_all_parameters()
+        self.parameter_tasks = dict()
+        self.eigenvalue_task_suffix = &quot;_eigenvalue&quot;
+        self.abnormal_task_suffix = &quot;_abnormal&quot;
+
+    def get_all_parameters(self):
+        return ParameterModel.objects.filter(task_code = self.task_code).distinct()
+
+    def calculate_eigenvalue(self, param_code: str, stop_execution: threading.Event) -&gt; Optional[str]:
+        &quot;&quot;&quot;
+        模拟特征值计算任务。
+        param_code: 参数编码
+        stop_execution: 停止信号标志
+        &quot;&quot;&quot;
+        for _ in range(4):  # 模拟分步计算
+            if stop_execution.is_set():
+                print(f&quot;[{param_code}] eigenvalue calculation aborted.&quot;)
+                return None
+            time.sleep(0.5)  # 模拟数据库查询、计算特征值时间
+        print(f&quot;[{param_code}] eigenvalue calculated.&quot;)
+        return f&quot;{param_code}_eigenvalue&quot;
+
+    def calculate_abnomaly(self, param_code: str, stop_execution: threading.Event) -&gt; Optional[str]:
+        &quot;&quot;&quot;
+        模拟参数判异任务。
+        param_code: 参数编码
+        stop_execution: 停止信号标志
+        &quot;&quot;&quot;
+        for _ in range(4):  # 模拟分步计算
+            if stop_execution.is_set():
+                print(f&quot;[{param_code}] abnomaly calculation aborted.&quot;)
+                return None
+            time.sleep(0.5)  # 模拟加载特征值到内存，判异计算时间
+        print(f&quot;[{param_code}] abnomaly calculated.&quot;)
+        return f&quot;{param_code}_abnomaly&quot;
+
+    def _build_task_name(self, tasks : List[str], ):
+
+        return &quot;&quot;.join(tasks)
+
+    def dismantling_tasks(self):
+        &quot;&quot;&quot;
+        拆解任务
+        :return: tasks
+        &quot;&quot;&quot;
+
+        for parameter in self.parameters:
+
+            # 参数编码
+            parameter_code = parameter.parameter_code
+            # 父级参数编码
+            parent_code = parameter.parent_code
+
+            eigenvalue_task_name = self._build_task_name([parameter_code, self.eigenvalue_task_suffix])
+            abnormal_task_name = self._build_task_name([parameter_code, self.abnormal_task_suffix])
+
+            self.parameter_tasks[eigenvalue_task_name] = {&quot;parameter_code&quot;: parent_code, &quot;dependencies&quot;: []}
+            self.parameter_tasks[abnormal_task_name] = {&quot;parameter_code&quot;: parent_code, &quot;dependencies&quot;: [eigenvalue_task_name]}
+
+            if parent_code:
+                self.parameter_tasks[eigenvalue_task_name]['dependencies'] = [self._build_task_name([parent_code, self.abnormal_task_suffix])]
+
+    def build_dag(self):
+        '''
+        构建有向无环图任务
+        :return:
+        '''
+        if not self.parameter_tasks:
+            self.dismantling_tasks()
+
+        tasks = {
+            task_name: Task(
+                task_name,
+                lambda stop_execution: self.calculate_eigenvalue(task_info['parameter_code'], stop_execution) if self.eigenvalue_task_suffix in task_name else \
+                lambda stop_execution: self.calculate_abnomaly(task_info['parameter_code'], stop_execution),
+                dependencies=list(task_info['dependencies'])
+            )
+            for task_name, task_info in self.parameter_tasks.items()
+        }
+        return tasks
+</code></pre>
+<h4 id="设计说明-2">设计说明：</h4>
+<ul>
+<li><strong>参数依赖处理</strong>：通过parent_code识别参数间的层级关系，确保父参数判异分析完成后才进行子参数的特征值计算。</li>
+<li><strong>任务命名规范</strong>：采用统一的命名规则（参数编码+任务类型后缀）便于任务识别与管理。</li>
+<li><strong>动态任务生成</strong>：根据参数配置动态生成对应的特征值计算和判异分析任务，提高系统灵活性。</li>
+</ul>
+<h3 id="3-任务调度与执行taskexecutor类">3、任务调度与执行：TaskExecutor类</h3>
+<p>TaskExecutor作为系统的核心调度器，实现了基于线程池的DAG任务调度算法，支持依赖感知的任务执行与异常处理。</p>
+<pre><code># task_executor.py
+
+import threading
+from asyncio import as_completed
+from concurrent.futures import ThreadPoolExecutor
+from typing import List
+from dag import Dag
+from task import Task
+
+class TaskExecutor:
+
+    def __int__(self, task_code):
+        self.task_code = task_code
+        self.tasks = dict[str, Task]
+
+    def execute_tasks(self) -&gt; None:
+        &quot;&quot;&quot;
+        执行所有任务，支持依赖关系和中止标志。
+        &quot;&quot;&quot;
+        stop_execution = threading.Event()  # 创建线程安全的标志位
+
+        if not self.tasks:
+            self.tasks = Dag(self.task_code).build_dag()
+        # 创建一个完整的任务映射（用于依赖检查）
+        all_tasks = self.tasks.copy()
+
+        # 查找可执行任务
+        def find_ready_tasks() -&gt; List[Task]:
+            return [
+                task
+                for name, task in remaining_tasks.items()
+                if task.result is None
+                   and all(all_tasks[dep].result is not None for dep in task.dependencies)
+                   and not stop_execution.is_set()  # 检查是否设置了终止标志
+            ]
+        remaining_tasks = self.tasks.copy()  # 创建一个用于管理未完成任务的副本
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures: dict = {}
+            while remaining_tasks and not stop_execution.is_set():
+                ready_tasks = find_ready_tasks()
+                if not ready_tasks:
+                    break  # 没有可执行任务，说明完成
+
+                for task in ready_tasks:
+                    if stop_execution.is_set():  # 如果终止标志已设置，停止调度
+                        break
+                    # 提交任务到线程池
+                    futures[executor.submit(task.run, stop_execution)] = task
+                    del remaining_tasks[task.name]  # 从未完成任务字典中移除
+
+                # 等待部分任务完成
+                for future in as_completed(futures):
+                    task = futures[future]
+                    try:
+                        future.result()  # 检查任务是否异常
+                    except Exception as e:
+                        print(f&quot;Task {task.name} failed with exception: {e}&quot;)
+                        stop_execution.set()  # 设置标志位，终止任务调度
+                        break
+                # 如果标志位已设置，退出调度
+                if stop_execution.is_set():
+                    print(&quot;Stopping all tasks due to failure.&quot;)
+                    break
+
+if __name__ == &quot;__main__&quot;:
+    # 模拟任务
+    TaskExecutor(task_code =&quot;TASK001&quot;).execute_tasks()
+</code></pre>
+<h4 id="设计说明-3">设计说明：</h4>
+<ul>
+<li><strong>依赖感知调度</strong>：通过find_ready_tasks函数动态识别依赖条件满足的可执行任务，确保执行顺序正确性。</li>
+<li><strong>线程池管理</strong>：使用ThreadPoolExecutor管理线程资源，控制并发度（本例中为4个worker）。</li>
+<li><strong>异常传播机制</strong>：任一任务执行失败时，通过stop_execution事件通知其他任务终止，避免资源浪费。</li>
+<li><strong>非阻塞调度</strong>：采用&quot;提交-等待&quot;循环模式，既保证任务依赖关系，又最大化利用线程池并行能力。</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Rancher如何给用户对k8s资源授权？]]></title>
+        <id>https://moruikang.github.io/post/rancher-ru-he-gei-yong-hu-dui-k8s-zi-yuan-shou-quan/</id>
+        <link href="https://moruikang.github.io/post/rancher-ru-he-gei-yong-hu-dui-k8s-zi-yuan-shou-quan/">
+        </link>
+        <updated>2023-11-25T13:25:18.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一-什么是rancher">一、什么是Rancher？</h2>
+<p>Rancher 是一个 Kubernetes 管理工具，让你能在任何地方和任何提供商上部署和运行集群。</p>
+<h2 id="二-k8s用户体系-权限">二、K8s用户体系 &amp; 权限</h2>
+<p>k8s本身不存储普通用户的信息，主要是通过service account 来做授权。<br>
+K8s 默认且推荐的授权模式，基于 “角色” 分配权限，灵活性高，支持细粒度控制。其对应的RBAC（Role-Based Access Control）概念如下</p>
+<h4 id="核心概念">核心概念：</h4>
+<ul>
+<li>Role/ClusterRole：定义权限集合（如 “允许查看 Pod”“允许创建 Deployment”）。</li>
+<li>Role：仅作用于单个命名空间。</li>
+<li>ClusterRole：作用于整个集群（或跨命名空间）。</li>
+<li>RoleBinding/ClusterRoleBinding：将 “角色” 绑定到 “用户 / 组 / 服务账户”（即 Subject），使其获得角色定义的权限。<br>
+RoleBinding：仅在单个命名空间内生效。<br>
+ClusterRoleBinding：在整个集群生效。<br>
+<img src="https://moruikang.github.io/post-images/1761400996913.png" alt="" loading="lazy"></li>
+</ul>
+<h2 id="三-rancher用户体系-权限">三、Rancher用户体系 &amp; 权限</h2>
+<h3 id="rancher用户">Rancher用户</h3>
+<p>Rancher 的用户不仅可以来自本地用户数据库，更常见的是集成外部认证系统，如：</p>
+<ul>
+<li>Active Directory / LDAP</li>
+<li>GitHub、Azure AD、Keycloak 等 OAuth2 提供商</li>
+<li>SAML 2.0 提供商<br>
+可以通过users.management.cattle.io这个CRD来查看用户信息。用户登陆后，rancher生成一个字符串的token保存在tokens.management.cattle.io 这个CRD里(简陋且粗暴)</li>
+</ul>
+<h3 id="rancher权限">Rancher权限</h3>
+<p>Rancher 的权限系统分为两层：</p>
+<ul>
+<li>全局权限（Global Permissions）：在 Rancher 层面定义的用户和角色，决定了用户能管理哪些集群、项目等 Rancher 资源。使用globalrolebinding 这个 CRD 来和用户绑定全局角色。</li>
+<li>集群/项目权限（Cluster/Project Permissions）：当用户进入一个具体的集群或项目后，其权限由映射到该集群的 Kubernetes RBAC 规则决定。使用clusterroletemplatebindings 这个 CRD 来和用户绑定集群角色；使用projectroletemplatebindings这个 CRD 来和用户绑定集群角色。<br>
+<img src="https://moruikang.github.io/post-images/1761404773728.png" alt="" loading="lazy"></li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>角色类型</th>
+<th>作用范围</th>
+<th>示例权限</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全局角色</td>
+<td>全局</td>
+<td>创建 / 删除集群、管理全局设置、分配集群权限等</td>
+</tr>
+<tr>
+<td>集群角色</td>
+<td>单个集群</td>
+<td>查看集群节点、创建 Deployment、管理集群网络策略等</td>
+</tr>
+<tr>
+<td>项目角色</td>
+<td>单个项目</td>
+<td>查看项目内 Pod、创建 Service、管理项目内命名空间等</td>
+</tr>
+</tbody>
+</table>
+<p>除此之外，rancher支持通过 Rancher UI 或 API 创建自定义角色，精确指定允许的操作（如 “仅允许查看 Pod 和日志，不允许修改”）。</p>
+<h2 id="四-授权">四、授权</h2>
+<p>这是最精巧的部分。授权分为 Rancher 层面和 Kubernetes 层面。</p>
+<h3 id="41-rancher-层面的授权">4.1 Rancher 层面的授权</h3>
+<p>角色（Roles）：Rancher 预定义了许多全局角色（如 Admin, User, Restricted Admin）和集群/项目角色（如 Cluster Owner, Project Member）。<br>
+绑定（Bindings）：管理员将用户或用户组绑定到某个角色，从而授予他们相应的权限。例如，将用户 Alice 绑定到 Cluster Owner 角色在 dev-cluster 上。<br>
+此时，Rancher 知道用户 Alice 在 dev-cluster 上拥有所有权限。</p>
+<h3 id="42-kubernetes-层面的授权如何落地">4.2 Kubernetes 层面的授权（如何落地）</h3>
+<p>这是关键！Rancher 如何将它的授权决策传递给下游的 Kubernetes 集群呢？它通过以下步骤自动完成：</p>
+<h4 id="421-创建和管理-serviceaccounts">4.2.1 创建和管理 ServiceAccounts</h4>
+<ul>
+<li>当 Rancher 导入或创建一个下游集群时，它会在该集群的 cattle-system 命名空间中创建一个强大的 ServiceAccount，并且使用这个ServiceAccount启动 cattle-cluster-agent 服务（rancher纳管集群的代理服务，从 rancher 发往 k8s 的请求都通过这个 agent 进行，且转发给 agent 的时候，携带了用户在 rancher 上的账号信息，也就是 user CR 的 metadata name）。<pre><code>$ kubectl -n cattle-system get po
+  NAME    READY 
+  cattle-cluster-agent-xxxx
+</code></pre>
+</li>
+<li>这个 ServiceAccount 被绑定了 cluster-admin 类似的超高权限，允许 Rancher 通过 cattle-cluster-agent 服务管理整个集群。</li>
+</ul>
+<h4 id="422-同步用户和角色">4.2.2 同步用户和角色</h4>
+<p>当你在 Rancher 中给用户分配集群或项目权限时，Rancher 会自动在下游集群中创建对应的Kubernetes RBAC 资源。</p>
+<ul>
+<li>为用户创建 ServiceAccount：Rancher 会在每个下游k8s集群的 cattle-impersonation-system 命名空间为每个用户创建一个唯一的 ServiceAccount。这个账户本身没有权限，只是一个标识。<pre><code>$ kubectl -n cattle-impersonation-system get serviceaccount
+  NAME    
+  cattle-impersonation-u-xxxx
+</code></pre>
+</li>
+<li>创建 RoleBindings/ClusterRoleBindings：Rancher 会根据用户在 Rancher 中的角色，在下游集群中创建相应的 ClusterRoleBinding 或 RoleBinding，将用户的 ServiceAccount 绑定到合适的 Kubernetes ClusterRole 或 Role 上。</li>
+<li>例如：Rancher 的 “Project Member” 角色可能对应 Kubernetes 里一个名为 projects-edit 的 ClusterRole。当用户被添加到项目时，Rancher 就在该项目对应的命名空间中创建一个 RoleBinding，将用户的 ServiceAccount 和 projects-edit 角色绑定起来。</li>
+</ul>
+<h3 id="43-扮演-伪装impersonation">4.3 扮演 &amp; 伪装（Impersonation）：</h3>
+<h4 id="什么是用户伪装impersonation">什么是用户伪装(Impersonation)？</h4>
+<p>详见k8s 关于用户伪装的介绍： https://kubernetes.io/zh-cn/docs/reference/access-authn-authz/authentication/<br>
+一个用户可以通过伪装（Impersonation）头部字段来以另一个用户的身份执行操作。 使用这一能力，你可以手动重载请求被身份认证所识别出来的用户信息。<br>
+以下是具体实施：</p>
+<ul>
+<li>当用户 Alice 通过 Rancher 想要列出 dev 命名空间的 Pods 时，这个请求首先发给 Rancher Server。</li>
+<li>Rancher Server 验证 Alice 的权限后，使用它那个高权限的 ServiceAccount 的 token，向下游集群的 API Server 发起请求。</li>
+<li>在这个请求中，Rancher 设置了两个关键的 HTTP Header：
+<ul>
+<li>Impersonate-User: u-abcdefghijk (这是 Alice 在下游集群中对应的唯一用户标识，通常与她的 ServiceAccount 关联)</li>
+<li>Impersonate-Group: system:authenticated (以及其他可能的组)</li>
+</ul>
+</li>
+<li>下游集群的 API Server 接收到请求后：
+<ul>
+<li>首先认证：使用 Rancher 的高权限 ServiceAccount token，认证通过。</li>
+<li>然后授权：它看到 Impersonate 头，会切换到“扮演模式”。它会检查高权限账户是<br>
+impersonate 动词的权限（它有），然后它会假装自己是用户 u-abcdefghijk。</li>
+<li>最后，API Server 会像处理普通用户请求一样，评估被扮演的用户 u-abcdefghijk 是否具有执行该操作（列出 Pods）的 RBAC 权限。这个权限正是之前由 Rancher 自动创建的 RoleBinding 所授予的。</li>
+</ul>
+</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Traefik插件系列之--熔断]]></title>
+        <id>https://moruikang.github.io/post/traefik-cha-jian-xi-lie-zhi-rong-duan/</id>
+        <link href="https://moruikang.github.io/post/traefik-cha-jian-xi-lie-zhi-rong-duan/">
+        </link>
+        <updated>2023-10-28T14:17:30.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一-什么是熔断">一、什么是熔断？</h2>
+<p>熔断（Circuit Breaker）是分布式系统中用于防止故障扩散、保护服务稳定性的一种容错机制，核心思想类似于现实中的电路保险丝：当某个服务或依赖组件出现持续故障时，“熔断” 机制会主动切断对它的调用，避免故障级联传播导致整个系统崩溃，同时为故障组件提供恢复时间。<br>
+作用：</p>
+<ul>
+<li>防止 “雪崩效应”</li>
+<li>在分布式系统中，若一个服务（如 A）依赖另一个服务（如 B），当 B 故障时，A 的大量请求会阻塞等待 B 的响应，导致 A 的资源（线程、连接池等）耗尽，进而影响依赖 A 的其他服务，最终引发整个系统瘫痪。熔断机制通过 “快速失败” 避免这种级联故障。<br>
+提高系统响应速度：当依赖服务故障时，熔断机制会直接返回预设的 “降级响应”（如缓存数据、默认值），而非等待超时，减少用户等待时间。</li>
+<li>自动恢复：在故障组件恢复后，熔断机制能逐步恢复正常调用，避免突然的流量冲击再次压垮服务。</li>
+</ul>
+<h2 id="二-traefik-熔断插件介绍">二、 traefik 熔断插件介绍</h2>
+<p>在 Kubernetes 中，Traefik 的熔断插件通过 CircuitBreaker 中间件实现</p>
+<h3 id="21-核心配置参数源码和-yaml如下">2.1 核心配置参数源码和 YAML如下</h3>
+<p>pkg/config/dynamic/middlewares.go</p>
+<pre><code>type CircuitBreaker struct {
+	// Expression defines the expression that, once matched, opens the circuit breaker and applies the fallback mechanism instead of calling the services.
+	Expression string `json:&quot;expression,omitempty&quot; toml:&quot;expression,omitempty&quot; yaml:&quot;expression,omitempty&quot; export:&quot;true&quot;`
+	// CheckPeriod is the interval between successive checks of the circuit breaker condition (when in standby state).
+	CheckPeriod ptypes.Duration `json:&quot;checkPeriod,omitempty&quot; toml:&quot;checkPeriod,omitempty&quot; yaml:&quot;checkPeriod,omitempty&quot; export:&quot;true&quot;`
+	// FallbackDuration is the duration for which the circuit breaker will wait before trying to recover (from a tripped state).
+	FallbackDuration ptypes.Duration `json:&quot;fallbackDuration,omitempty&quot; toml:&quot;fallbackDuration,omitempty&quot; yaml:&quot;fallbackDuration,omitempty&quot; export:&quot;true&quot;`
+	// RecoveryDuration is the duration for which the circuit breaker will try to recover (as soon as it is in recovering state).
+	RecoveryDuration ptypes.Duration `json:&quot;recoveryDuration,omitempty&quot; toml:&quot;recoveryDuration,omitempty&quot; yaml:&quot;recoveryDuration,omitempty&quot; export:&quot;true&quot;`
+	// ResponseCode is the status code that the circuit breaker will return while it is in the open state.
+	ResponseCode int `json:&quot;responseCode,omitempty&quot; toml:&quot;responseCode,omitempty&quot; yaml:&quot;responseCode,omitempty&quot; export:&quot;true&quot;`
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">参数名称</th>
+<th style="text-align:center">类型</th>
+<th style="text-align:center">说明</th>
+<th style="text-align:center">示例值 / 默认值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">expression</td>
+<td style="text-align:center">String</td>
+<td style="text-align:center">熔断触发条件表达式，支持多种指标组合（如错误率、延迟）。</td>
+<td style="text-align:center">&quot;NetworkErrorRatio() &gt; 0.3&quot;</td>
+</tr>
+<tr>
+<td style="text-align:center">fallbackDuration</td>
+<td style="text-align:center">Duration</td>
+<td style="text-align:center">熔断状态（Tripped）的持续时间，期间所有请求触发降级。</td>
+<td style="text-align:center">10s（默认）</td>
+</tr>
+<tr>
+<td style="text-align:center">recoveryDuration</td>
+<td style="text-align:center">Duration</td>
+<td style="text-align:center">恢复阶段（Recovering）的持续时间，期间逐步恢复流量。</td>
+<td style="text-align:center">10s（默认）</td>
+</tr>
+<tr>
+<td style="text-align:center">checkPeriod</td>
+<td style="text-align:center">Duration</td>
+<td style="text-align:center">熔断条件的检查间隔（仅在 Standby 状态生效）。</td>
+<td style="text-align:center">100ms（默认）</td>
+</tr>
+<tr>
+<td style="text-align:center">responseCode</td>
+<td style="text-align:center">Integer</td>
+<td style="text-align:center">熔断时返回的 HTTP 状态码（默认 503）。</td>
+<td style="text-align:center">503 或 200（自定义）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-expression表达式有以下三种类型">2.2 expression表达式有以下三种类型：</h3>
+<ul>
+<li><strong>网络错误率 <code>NetworkErrorRatio</code> : NetworkErrorRatio() &gt; 0.30 ，网络错误率大于30%触发</strong></li>
+<li><strong>状态码比例 <code>ResponseCodeRatio</code> : ResponseCodeRatio(500, 600, 0, 600) &gt; 0.3，5xx的状态码大于总请求(在2xx-5xx状态码内)的30%触发</strong></li>
+<li><strong>延迟阈值 <code>LatencyAtQuantileMS</code> : LatencyAtQuantileMS(50.0) &gt; 100 ，50%请求延迟&gt; 100ms</strong></li>
+<li>组合条件：支持 ||（或）和 &amp;&amp;（且）运算符，例如：<pre><code>expression: &quot;LatencyAtQuantileMS(50.0) &gt; 200 &amp;&amp; NetworkErrorRatio() &gt; 0.2&quot;
+</code></pre>
+</li>
+</ul>
+<h3 id="23-yaml示例">2.3 YAML示例：</h3>
+<h4 id="231-基础熔断配置基于网络错误率">2.3.1. 基础熔断配置（基于网络错误率）</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-circuit-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;NetworkErrorRatio() &gt; 0.3&quot;  # 网络错误率超过30%时熔断
+    fallbackDuration: 10s                    # 熔断持续10秒
+    recoveryDuration: 15s                    # 恢复阶段持续15秒
+</code></pre>
+<h4 id="232-基于响应状态码和延迟的组合条件">2.3.2. 基于响应状态码和延迟的组合条件</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: combined-condition-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;LatencyAtQuantileMS(50.0) &gt; 200 || ResponseCodeRatio(500, 600, 0, 600) &gt; 0.2&quot;
+    # 50%请求延迟超过200ms 或 5xx状态码占比超过20%时熔断
+    fallbackDuration: 20s
+    responseCode: 500                        # 熔断时返回500状态码
+</code></pre>
+<h4 id="233-自定义恢复阶段的流量比例">2.3.3. 自定义恢复阶段的流量比例</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: custom-recovery-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;NetworkErrorRatio() &gt; 0.5&quot;
+    fallbackDuration: 10s
+    recoveryDuration: 30s                    # 恢复阶段延长至30秒
+    # 恢复阶段的流量比例公式：0.5 * (当前时间 - 恢复开始时间) / recoveryDuration
+    # 30秒后允许50%的请求通过
+</code></pre>
+<h4 id="234-基于路径的熔断配置">2.3.4. 基于路径的熔断配置</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: path-based-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;NetworkErrorRatio() &gt; 0.4&quot;
+    fallbackDuration: 10s
+    # 仅对路径 /api/v1/orders 生效（通过 IngressRoute 绑定）
+</code></pre>
+<h2 id="三-熔断状态机">三 熔断状态机</h2>
+<h3 id="31-熔断器有三个状态">3.1 熔断器有三个状态:</h3>
+<ul>
+<li>Closed(关闭): 正常运行,收集指标并定期检查表达式</li>
+<li>Open(打开): 触发降级机制,持续 FallbackDuration 时间后进入恢复状态</li>
+<li>Recovering(恢复): 线性递增流量,持续 RecoveryDuration 时间</li>
+</ul>
+<h3 id="32-熔断器的恢复行为由以下参数控制">3.2 熔断器的恢复行为由以下参数控制</h3>
+<ul>
+<li>RecoveryDuration: 恢复阶段的持续时间,默认 10 秒</li>
+<li>FallbackDuration: 打开状态的持续时间,默认 10 秒</li>
+<li>CheckPeriod: 检查周期,默认 100 毫秒</li>
+</ul>
+<p>Traefik 的熔断器实现依赖于 vulcand/oxy 库的 cbreaker.CircuitBreaker。 在创建熔断器时,这些配置参数会被传递给底层实现<br>
+恢复期间的具体流量控制逻辑由 oxy 库实现,Traefik 通过配置 RecoveryDuration 参数来控制恢复时长。在恢复期间,如果服务再次失败,熔断器会重新打开;如果整个恢复期间服务正常运行,熔断器会关闭。<br>
+核心代码如下：<br>
+vulcand/oxy/v2/cbreaker.go</p>
+<pre><code>// CircuitBreaker is http.Handler that implements circuit breaker pattern.
+type CircuitBreaker struct {
+	m       *sync.RWMutex
+	metrics *memmetrics.RTMetrics
+
+	condition hpredicate
+
+	fallbackDuration time.Duration
+	recoveryDuration time.Duration
+
+	onTripped SideEffect
+	onStandby SideEffect
+
+	state cbState
+	until clock.Time
+
+	rc *ratioController
+
+	checkPeriod time.Duration
+	lastCheck   clock.Time
+
+	fallback http.Handler
+	next     http.Handler
+
+	verbose bool
+	log     utils.Logger
+}
+
+// updateState updates internal state and returns true if fallback should be used and false otherwise.
+func (c *CircuitBreaker) activateFallback(_ http.ResponseWriter, _ *http.Request) bool {
+	// Quick check with read locks optimized for normal operation use-case
+	if c.isStandby() {
+		return false
+	}
+	// Circuit breaker is in tripped or recovering state
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	c.log.Warn(&quot;%v is in error state&quot;, c)
+
+	switch c.state {
+	case stateStandby:
+		// someone else has set it to standby just now
+		return false
+	case stateTripped:
+		if clock.Now().UTC().Before(c.until) {
+			return true
+		}
+		// We have been in active state enough, enter recovering state
+		c.setRecovering()
+		fallthrough
+	case stateRecovering:
+		// We have been in recovering state enough, enter standby and allow request
+		if clock.Now().UTC().After(c.until) {
+			c.setState(stateStandby, clock.Now().UTC())
+			return false
+		}
+		// ratio controller allows this request
+		if c.rc.allowRequest() {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (c *CircuitBreaker) isStandby() bool {
+	c.m.RLock()
+	defer c.m.RUnlock()
+	return c.state == stateStandby
+}
+
+// String returns log-friendly representation of the circuit breaker state.
+func (c *CircuitBreaker) String() string {
+	switch c.state {
+	case stateTripped, stateRecovering:
+		return fmt.Sprintf(&quot;CircuitBreaker(state=%v, until=%v)&quot;, c.state, c.until)
+	default:
+		return fmt.Sprintf(&quot;CircuitBreaker(state=%v)&quot;, c.state)
+	}
+}
+
+// exec executes side effect.
+func (c *CircuitBreaker) exec(s SideEffect) {
+	if s == nil {
+		return
+	}
+	go func() {
+		if err := s.Exec(); err != nil {
+			c.log.Error(&quot;%v side effect failure: %v&quot;, c, err)
+		}
+	}()
+}
+
+func (c *CircuitBreaker) setState(state cbState, until time.Time) {
+	c.log.Debug(&quot;%v setting state to %v, until %v&quot;, c, state, until)
+	c.state = state
+	c.until = until
+	switch state {
+	case stateTripped:
+		c.exec(c.onTripped)
+	case stateStandby:
+		c.exec(c.onStandby)
+	}
+}
+
+func (c *CircuitBreaker) timeToCheck() bool {
+	c.m.RLock()
+	defer c.m.RUnlock()
+	return clock.Now().UTC().After(c.lastCheck)
+}
+
+// Checks if tripping condition matches and sets circuit breaker to the tripped state.
+func (c *CircuitBreaker) checkAndSet() {
+	if !c.timeToCheck() {
+		return
+	}
+
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	// Other goroutine could have updated the lastCheck variable before we grabbed mutex
+	if clock.Now().UTC().Before(c.lastCheck) {
+		return
+	}
+	c.lastCheck = clock.Now().UTC().Add(c.checkPeriod)
+
+	if c.state == stateTripped {
+		c.log.Debug(&quot;%v skip set tripped&quot;, c)
+		return
+	}
+
+	if !c.condition(c) {
+		return
+	}
+
+	c.setState(stateTripped, clock.Now().UTC().Add(c.fallbackDuration))
+	c.metrics.Reset()
+}
+
+func (c *CircuitBreaker) setRecovering() {
+	c.setState(stateRecovering, clock.Now().UTC().Add(c.recoveryDuration))
+	c.rc = newRatioController(c.recoveryDuration, c.log)
+}
+
+// cbState is the state of the circuit breaker.
+type cbState int
+
+func (s cbState) String() string {
+	switch s {
+	case stateStandby:
+		return &quot;standby&quot;
+	case stateTripped:
+		return &quot;tripped&quot;
+	case stateRecovering:
+		return &quot;recovering&quot;
+	}
+	return &quot;undefined&quot;
+}
+
+const (
+	// CircuitBreaker is passing all requests and watching stats.
+	stateStandby = iota
+	// CircuitBreaker activates fallback scenario for all requests.
+	stateTripped
+	// CircuitBreaker passes some requests to go through, rejecting others.
+	stateRecovering
+)
+
+const (
+	defaultFallbackDuration = 10 * clock.Second
+	defaultRecoveryDuration = 10 * clock.Second
+	defaultCheckPeriod      = 100 * clock.Millisecond
+)
+</code></pre>
+<h3 id="33-从熔断tripped到恢复recovering的触发">3.3 从熔断（Tripped）到恢复（Recovering）的触发</h3>
+<p>当系统进入Tripped状态后，所有请求会被降级处理，持续时间由fallbackDuration（默认 10 秒）控制。当该时长结束后，自动进入Recovering状态，开始恢复流程：</p>
+<h4 id="331-tripped-状态的持续检查">3.3.1 Tripped 状态的持续检查：</h4>
+<p>在activateFallback函数中，每次请求到来时会检查Tripped状态的截止时间（until字段，初始化为进入Tripped时的时间 + fallbackDuration）。</p>
+<pre><code>case stateTripped:
+    if clock.Now().UTC().Before(c.until) {
+        return true // 仍在熔断期，继续降级
+    }
+    // 熔断期结束，进入恢复状态
+    c.setRecovering()
+</code></pre>
+<h4 id="332-进入-recovering-状态的初始化">3.3.2 进入 Recovering 状态的初始化：</h4>
+<p>调用setRecovering()函数，完成以下操作：</p>
+<ul>
+<li>状态切换为stateRecovering，并设置恢复阶段的截止时间（until = 当前时间 + recoveryDuration，默认 10 秒）。</li>
+<li>初始化ratioController（比例控制器），用于控制恢复阶段允许通过的请求比例。</li>
+<li>触发状态转换副作用（如配置了OnTripped回调，会在进入 Tripped 时执行，但此处是从 Tripped 到 Recovering 的过渡）。</li>
+</ul>
+<h3 id="34-recovering恢复状态的核心逻辑">3.4 Recovering（恢复）状态的核心逻辑</h3>
+<p>恢复阶段的目标是逐步将流量放回到原始服务，同时验证服务是否稳定（不再次触发熔断条件）。核心机制是 “线性递增允许通过的请求比例” 和 “持续监控错误条件”。</p>
+<h4 id="341-渐进式流量控制比例控制器ratiocontroller">3.4.1. 渐进式流量控制：比例控制器（ratioController）</h4>
+<p>恢复阶段通过ratioController控制允许通过的请求比例，规则为线性增长：</p>
+<pre><code>//	allowedRequestsRatio = 0.5 * (Now() - StartRecovery())/RecoveryDuration
+即：
+allowedRequestsRatio = 0.5 * (当前时间 - 恢复开始时间) / recoveryDuration
+</code></pre>
+<ul>
+<li>恢复开始时（t=0）：allowedRequestsRatio = 0 → 几乎不允许请求通过（仅极少量试探）。</li>
+<li>恢复中期（t = recoveryDuration/2）：allowedRequestsRatio = 0.25 → 允许 25% 的请求通过。</li>
+<li>恢复结束时（t = recoveryDuration）：allowedRequestsRatio = 0.5 → 允许 50% 的请求通过（注：代码中系数为 0.5，最终最大比例为 50%，而非 100%，确保即使恢复完成也留有缓冲）。<br>
+ratioController的allowRequest()方法会根据当前时间计算比例，并随机决定是否允许当前请求通过（类似 “概率性放量”），例如：当比例为 25% 时，约 25% 的请求会被放行到原始服务，其余仍降级。</li>
+</ul>
+<h4 id="342-恢复阶段的请求处理流程">3.4.2  恢复阶段的请求处理流程</h4>
+<p>在Recovering状态下，每次请求到来时的处理逻辑（activateFallback函数）：</p>
+<pre><code>case stateRecovering:
+    // 检查恢复阶段是否结束
+    if clock.Now().UTC().After(c.until) {
+        c.setState(stateStandby, clock.Now().UTC()) // 恢复完成，回到正常状态
+        return false // 允许所有请求通过
+    }
+    // 未结束：由比例控制器决定是否允许当前请求
+    if c.rc.allowRequest() {
+        return false // 允许请求通过，访问原始服务
+    }
+    return true // 不允许，触发降级
+</code></pre>
+<ul>
+<li>若恢复时间未结束：按比例控制器的规则决定是否放行请求。</li>
+<li>若恢复时间已结束（超过recoveryDuration）：直接切换到Standby状态，所有请求恢复正常通行。</li>
+</ul>
+<h4 id="343-恢复阶段的稳定性校验">3.4.3. 恢复阶段的稳定性校验</h4>
+<p>在恢复阶段，每次请求处理后会通过checkAndSet()函数定期（checkPeriod，默认 100ms）校验熔断条件：</p>
+<pre><code>func (c *CircuitBreaker) checkAndSet() {
+    if !c.timeToCheck() { // 未到检查时间，跳过
+        return
+    }
+    // 加锁后检查熔断条件
+    if c.condition(c) { // 若再次满足熔断条件（如错误率过高）
+        c.setState(stateTripped, clock.Now().UTC().Add(c.fallbackDuration)) // 重新进入熔断状态
+        c.metrics.Reset() // 重置监控指标，重新统计
+    }
+}
+</code></pre>
+<ul>
+<li>若在恢复阶段中，熔断条件（如错误率超过阈值）再次被触发：立即从Recovering切回Tripped状态，重新开始熔断计时（fallbackDuration），相当于 “恢复失败”。</li>
+<li>若整个恢复阶段（recoveryDuration）内未触发熔断条件：恢复结束后切回Standby状态，即 “恢复成功”。</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Harbor 2.0.1 CPU 打满定位和解决]]></title>
+        <id>https://moruikang.github.io/post/harbor-201-cpu-da-man-ding-wei-he-jie-jue/</id>
+        <link href="https://moruikang.github.io/post/harbor-201-cpu-da-man-ding-wei-he-jie-jue/">
+        </link>
+        <updated>2022-10-12T14:05:02.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一-问题背景">一、问题背景</h2>
+<h3 id="11-故障现象">1.1 故障现象</h3>
+<p>监控系统告警Harbor Core节点16核心CPU持续打满（CPU 使用率 100%），后续扩容到32核依然快速打满<br>
+PaaS端获取镜像tag出现超时（P99延迟 &gt; 10s）</p>
+<h2 id="二-根因分析">二、根因分析</h2>
+<h3 id="21-服务器层分析">2.1 服务器层分析</h3>
+<pre><code>top 指令对CPU排序后，发现都是Pg进程导致CPU打满
+</code></pre>
+<h3 id="22数据库层分析">2.2数据库层分析</h3>
+<p>慢查询定位<br>
+通过PostgreSQL内置监控视图pg_stat_activity捕获SQL：</p>
+<pre><code>select
+	datname,
+	usename,
+	client_addr,
+	application_name,
+	state,
+	backend_start,
+	xact_start,
+	xact_stay,
+	query_start,
+	query_stay,
+	replace(query, chr(10), ' ') as query
+from
+	(
+	select
+		pgsa.datname as datname,
+		pgsa.usename as usename,
+		pgsa.client_addr client_addr,
+		pgsa.application_name as application_name,
+		pgsa.state as state,
+		pgsa.backend_start as backend_start,
+		pgsa.xact_start as xact_start,
+		extract(epoch from (now() - pgsa.xact_start)) as xact_stay,
+		pgsa.query_start as query_start,
+		extract(epoch from (now() - pgsa.query_start)) as query_stay ,
+		pgsa.query as query
+	from
+		pg_stat_activity as pgsa
+	where
+		pgsa.state != 'idle'
+		and pgsa.state != 'idle in transaction'
+		and pgsa.state != 'idle in transaction (aborted)') idleconnections
+order by
+	query_stay desc
+limit 5;
+</code></pre>
+<p>看到大量慢SQL，类似如下：</p>
+<pre><code>SELECT COUNT(*) FROM &quot;artifact&quot; T0 
+WHERE T0.&quot;repository_id&quot; = 651 
+AND T0.&quot;id&quot; IN (
+    SELECT DISTINCT art.id FROM artifact art
+    LEFT JOIN tag ON art.id=tag.artifact_id
+    LEFT JOIN artifact_reference ref ON art.id=ref.child_id 
+    WHERE tag.id IS NOT NULL OR ref.id IS NULL
+)
+</code></pre>
+<p>执行计划分析（EXPLAIN ANALYZE）<br>
+关键性能瓶颈点：<br>
+全表扫描：在artifact表上未命中索引<br>
+嵌套循环：多层子查询导致O(n²)复杂度<br>
+无效JOIN：LEFT JOIN后未有效利用索引</p>
+<h3 id="三-寻找解决方案">三、寻找解决方案</h3>
+<h4 id="31-尝试索引优化策略">3.1 尝试索引优化策略</h4>
+<pre><code>-- 关键字段索引补全
+CREATE INDEX CONCURRENTLY idx_artifact_repo_id ON artifact(repository_id);
+CREATE INDEX CONCURRENTLY idx_tag_artifact_id ON tag(artifact_id);
+CREATE INDEX CONCURRENTLY idx_ref_child_id ON artifact_reference(child_id);
+
+-- 复合索引优化
+CREATE INDEX CONCURRENTLY idx_artifact_repo_push_time 
+ON artifact(repository_id, push_time);
+</code></pre>
+<p>创建以上索引后，发现问题依旧</p>
+<h4 id="32-重构慢查询sql">3.2  重构慢查询SQL</h4>
+<p>在github harbor仓库里搜索到同样的issue:<br>
+https://github.com/goharbor/harbor/issues/13890<br>
+官方建议优化SQL语句：https://github.com/goharbor/harbor/pull/14925/commits/dc059a9a8f74f759e8bf155ca5a406a2825712af<br>
+优化前的SQL：</p>
+<pre><code>#代码src/pkg/artifact/dao/dao.go
+const (
+	// both tagged and untagged artifacts
+	both = `IN (
+		SELECT DISTINCT art.id FROM artifact art
+		LEFT JOIN tag ON art.id=tag.artifact_id
+		LEFT JOIN artifact_reference ref ON art.id=ref.child_id
+		WHERE tag.id IS NOT NULL OR ref.id IS NULL)`
+	// only untagged artifacts
+	untagged = `IN (
+		SELECT DISTINCT art.id FROM artifact art
+		LEFT JOIN tag ON art.id=tag.artifact_id
+		WHERE tag.id IS NULL)`
+	// only tagged artifacts
+	tagged = `IN (
+		SELECT DISTINCT art.id FROM artifact art
+		JOIN tag ON art.id=tag.artifact_id
+		WHERE tag.id IS NOT NULL)`
+	// the QuerySetter of beego doesn't support &quot;EXISTS&quot; directly, use qs.FilterRaw(&quot;id&quot;, &quot;=id AND xxx&quot;) to workaround the limitation
+	// base filter: both tagged and untagged artifacts
+    ```
+    
+优化后的SQL：
+    ```
+
+	both = `=id AND (
+		EXISTS (SELECT 1 FROM tag WHERE tag.artifact_id = T0.id)
+		OR 
+		NOT EXISTS (SELECT 1 FROM artifact_reference ref WHERE ref.child_id = T0.id)
+	)`
+	// tag filter: only untagged artifacts
+	// the &quot;untagged&quot; filter is based on &quot;base&quot; filter, so we consider the tag only
+	untagged = `=id AND NOT EXISTS(
+		SELECT 1 FROM tag WHERE tag.artifact_id = T0.id
+	)`
+	// tag filter: only tagged artifacts
+	tagged = `=id AND EXISTS (
+		SELECT 1 FROM tag WHERE tag.artifact_id = T0.id
+	)`
+)
+</code></pre>
+<p>优化原理<br>
+消除冗余的DISTINCT操作<br>
+将IN子查询改写为EXISTS半连接<br>
+利用布尔短路特性提前终止条件判断</p>
+<p>因为该版本的Harbor和公司PaaS深度继承，无法升级到官方已经优化后的SQL版本(Harbor 2.2之后)，所以只能对Harbor源码导致慢查询的SQL代码修改后，重新构建镜像</p>
+<h2 id="四-修改源码后重新构建harbor-core镜像">四、修改源码后，重新构建Harbor core镜像</h2>
+<pre><code>git clone https://github.com/goharbor/harbor.git
+cd harbor
+git checkout v2.0.1
+
+</code></pre>
+<p>可以在Makefile里面看到所有的镜像构建指令，写的比较复杂，只需要关注core镜像部分即可，以下是我整理后的构建指令</p>
+<pre><code>#删除旧二进制文件
+rm make/photon/core/harbor_core
+
+#编译二进制文件
+make compile_core
+
+#修改version文件，需要跟原来镜像保持一致
+#vim make/photon/prepare/versions
+
+#手动构建core镜像
+docker build --build-arg harbor_base_image_version=dev --build-arg harbor_base_namespace=goharbor -f /root/harbor-2.0.1/make/photon/core/Dockerfile -t goharbor/harbor-core:v2.0.1-hotfix20220916 .
+</code></pre>
+<p>随后，替换线上环境Harbor core镜像即可</p>
+<p>上线后，CPU立马下降</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Kubernetes(calico IPIP模式)如何与本地办公网络互通？]]></title>
+        <id>https://moruikang.github.io/post/kubernetescalico-ipip-mo-shi-ru-he-yu-ben-di-ban-gong-wang-luo-hu-tong/</id>
+        <link href="https://moruikang.github.io/post/kubernetescalico-ipip-mo-shi-ru-he-yu-ben-di-ban-gong-wang-luo-hu-tong/">
+        </link>
+        <updated>2021-10-21T13:44:57.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="需求背景">需求背景</h2>
+<p>在PaaS开发环境中，开发人员经常需要调试部署在PaaS平台上的服务。传统方式可能需要复杂的端口转发或ingress设置，影响开发调试效率。我们的目标是让开发人员能够直接从本地计算机访问Kubernetes集群中的服务，就像访问本地服务一样简单。</p>
+<h2 id="网络环境现状">网络环境现状</h2>
+<h3 id="kubernetes集群网络">Kubernetes集群网络：</h3>
+<ul>
+<li>Service CIDR: 172.1.0.0/16</li>
+<li>Pod CIDR: 172.2.0.0/16</li>
+<li>网络插件：Calico（IPIP模式）</li>
+<li>办公室网络：10.168.0.0/16</li>
+</ul>
+<h2 id="解决方案原理">解决方案原理</h2>
+<p>通过路由配置将办公室网络到Kubernetes网络的双向流量打通，使办公室网络中的设备可以直接访问Kubernetes集群中的Service和Pod。</p>
+<h3 id="技术细节">技术细节</h3>
+<h4 id="1-calico-ipip模式深入解析">1、Calico IPIP模式深入解析</h4>
+<p>IPIP隧道工作原理</p>
+<pre><code>+---------------------------------------------------+
+| 原始IP包头 (源: 办公室IP, 目的: Pod IP)           |
++---------------------------------------------------+
+| IPIP头 (协议号: 4)                                |
++---------------------------------------------------+
+| 外部IP头 (源: 节点IP, 目的: 目标节点IP)           |
++---------------------------------------------------+
+</code></pre>
+<h5 id="封装过程">封装过程：</h5>
+<ul>
+<li>办公室网络发往Pod的数据包到达Kubernetes节点</li>
+<li>Calico通过IPIP隧道封装原始数据包</li>
+<li>添加新的IP头，使用节点IP作为源和目的地址</li>
+<li>通过物理网络传输到目标节点</li>
+<li>目标节点解封装，将原始数据包发送到目标Pod</li>
+</ul>
+<h5 id="ipip模式优缺点">IPIP模式优缺点</h5>
+<p>优点：</p>
+<ul>
+<li>跨子网Pod通信</li>
+<li>对底层网络要求较低</li>
+<li>配置相对简单</li>
+</ul>
+<p>缺点：</p>
+<ul>
+<li>额外的封装开销（约20字节）</li>
+<li>性能略低于BGP模式</li>
+</ul>
+<h4 id="2-主机内核参数调整">2、主机内核参数调整</h4>
+<p>在每一台k8s主机上配置内核参数：</p>
+<pre><code># 在所有Kubernetes节点上执行
+echo 'net.ipv4.conf.tunl0.rp_filter = 2' &gt;&gt; /etc/sysctl.conf
+echo 'net.ipv4.ip_forward = 1' &gt;&gt; /etc/sysctl.conf
+sysctl -p
+</code></pre>
+<p>net.ipv4.conf.tunl0.rp_filter = 2<br>
+反向路径过滤（Reverse Path Filtering）：这是一种安全机制，用于验证数据包的来源是否可信<br>
+tunl0接口：这是Calico IPIP模式创建的隧道接口，用于在节点间封装Pod流量<br>
+值说明：<br>
+0：关闭反向路径验证<br>
+1：严格模式，要求进出路径完全一致<br>
+2：宽松模式，只要有一张网卡能到达源地址即允许<br>
+选择2的原因：在IPIP隧道环境中，数据包的进出路径可能不同，宽松模式确保隧道流量正常转发</p>
+<p>net.ipv4.ip_forward = 1<br>
+IPv4包转发：启用所有接口的IPv4数据包转发功能，允许节点作为路由器转发不是发往本机的数据包</p>
+<h4 id="3-办公室路由配置方案">3. 办公室路由配置方案</h4>
+<p>公司路由器配置</p>
+<pre><code># 添加Kubernetes网络路由
+ip route add 172.1.0.0/16 via &lt;K8s-Master-Node-IP&gt;
+ip route add 172.2.0.0/16 via &lt;K8s-Master-Node-IP&gt;
+</code></pre>
+<p>路由选择策略<br>
+选择Master节点作为网关的原因：</p>
+<ul>
+<li>稳定性：Master节点通常不会频繁重启或变更</li>
+<li>可达性：Master节点能够与所有Worker节点通信</li>
+<li>负载考虑：在开发环境中，流量相对较小，Master节点可以承担转发任务</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[云上(AWS)kubernetes自动扩容缩容最佳实践]]></title>
+        <id>https://moruikang.github.io/post/yun-shang-awskubernetes-zi-dong-kuo-rong-suo-rong-zui-jia-shi-jian/</id>
+        <link href="https://moruikang.github.io/post/yun-shang-awskubernetes-zi-dong-kuo-rong-suo-rong-zui-jia-shi-jian/">
+        </link>
+        <updated>2020-01-13T14:05:10.000Z</updated>
+        <content type="html"><![CDATA[<h3 id="为什么需要扩容缩容">为什么需要扩容缩容？</h3>
+<p>相信很多企业会面临扩容缩容的场景，当业务规模增多时，我们需要快速的扩大我们的应用及基础架构，当需求减少时我们也需要适当缩减开支，又不能影响当前服务稳定性。Kubernetes是易于扩展的，它具有许多工具，可根据需求和有效的指标来扩展应用程序及其托管的基础架构。</p>
+<h2 id="一-kubernetes-autoscaling">一. kubernetes autoscaling</h2>
+<p>kubernetes给我们提供了以下2个纬度的扩容方法：</p>
+<h3 id="1-基于pod的伸缩">1. 基于pod的伸缩</h3>
+<h4 id="11-horizontal-pod-autoscalerhpa">1.1 Horizontal Pod Autoscaler（HPA）</h4>
+<p>可以基于CPU/MEM利用率自动伸缩replication controller、deployment和replica set中的pod数量;也可以基于外部指标或者自定义指标伸缩，比如来自metrics.k8s.io，external.metrics.k8s.io和custom.metrics.k8s.io的指标。<br>
+伸缩算法细节：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )]
+#  ceil：返回不小于value 的下一个整数
+</code></pre>
+<p>举以下例子</p>
+<pre><code>apiVersion: autoscaling/v2beta1
+kind: HorizontalPodAutoscaler
+metadata:
+name: nginx
+namespace: default
+spec:
+maxReplicas: 6
+minReplicas: 1
+scaleTargetRef:
+  apiVersion: extensions/v1beta1
+  kind: Deployment
+  name: nginx
+metrics:
+- type: Resource #指标来源自metrics server
+  resource:
+    name: cpu
+    targetAverageValue: 100m
+</code></pre>
+<p>如果当前是1个pod，目标设定值为100m，pod cpu平均指标达到200m，那么由算法计算公式：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )] 
+</code></pre>
+<p>等于</p>
+<pre><code>desiredReplicas = ceil[1 * (200/100)] = 2 (个)
+</code></pre>
+<p>于是pod的数量将会增加到2个。<br>
+如果当前是2个pod，目标设定值为100m，当前cpu指标为50m，那么由算法计算公式：</p>
+<pre><code>desiredReplicas = ceil[currentReplicas * ( currentMetricValue / desiredMetricValue )] 
+</code></pre>
+<p>等于</p>
+<pre><code>desiredReplicas = ceil[2 * (50/100)] = 1 (个)
+</code></pre>
+<p>于是pod的数量将会减少到1个。<br>
+如果计算出的缩放比例接近1.0（跟据--horizontal-pod-autoscaler-tolerance 参数全局配置的容忍值，默认为0.1），将会放弃本次缩放。</p>
+<p>在使用HPA时需要关注以下几点：</p>
+<ul>
+<li>HPA的默认检查间隔为30秒。可以通过控制器的&quot;horizo​​ntal-pod-autoscaler-sync-period&quot;标志进行配置</li>
+<li>默认HPA相对指标误差为10％</li>
+<li>在最后一次扩展pod发生后，HPA需等待3分钟，以使指标稳定下来。可以通过&quot; horizo​​ntal-pod-autoscaler-upscale-delay&quot;参数进行调整</li>
+<li>从上一次缩小pod开始，HPA等待5分钟，以避免伸缩抖动。可通过以下方式配置：&quot;horizo​​ntal-pod-autoscaler-downscale-delay&quot;参数进行调整</li>
+<li>HPA与deployment一起使用时效果最好</li>
+</ul>
+<h4 id="12-vertical-pod-autoscalervpa">1.2 Vertical Pod Autoscaler（VPA）</h4>
+<p>VPA主要用于有状态服务，它可根据需要为Pod增加CPU或内存——它也适用于无状态的Pod。当触发到VPA设定的阈值时，pod会被重新启动以更新新的CPU和内存资源请求，以避免pod内的容器OOM（内存不足）事件。重新启动Pod的时候，VPA始终确保根据Pod分配预算（PDB）确定最小数量，您可以设置可用pod数量的最大和最小限制。</p>
+<h3 id="2-基于集群级别的自动伸缩cluster-autoscaling简称ca主要是扩容缩容节点">2. 基于集群级别的自动伸缩(Cluster Autoscaling，简称CA，主要是扩容缩容节点)</h3>
+<p>扩容：当集群中资源不足，kubernetes scheduler无法调度pod到资源充足的节点，pod会处于pending状态，这时候需要扩容集群节点。<br>
+缩容：集群中有一些节点未被充分利用的时间很长，造成浪费，这时候它们的容器可以驱逐到其他现有节点上，然后终止这些节点，完成集群缩容。</p>
+<h4 id="21-什么时候ca扩容节点">2.1 什么时候CA扩容节点？</h4>
+<p>当存在由于资源不足而kubernetes scheduler无法调度的Pod时，CA会增加群集的大小。可以将其配置为不向上或向下扩展一定数量的计算机。下图是扩展决策的概述<br>
+<img src="https://moruikang.github.io/post-images/1739887755150.jpg" alt="" loading="lazy"></p>
+<ul>
+<li>1 集群自动缩放算法检查pending状态的Pod</li>
+<li>2 如果出现以下情况，CA将申请一个新的节点：1）没有足够的集群资源来满足pod requests resource而处于pending状态的Pod；2）集群或节点未达到用户定义的最大节点数。</li>
+<li>3 AWS上kubernetes节点都是使用autoscaling group起的，一旦加入新节点，Kubernetes就会检测到</li>
+<li>4 Kubernetes scheduler将pending的Pod调度到新节点</li>
+<li>5 如果仍有pod处于pending状态，返回步骤1</li>
+</ul>
+<h4 id="22-什么时候ca缩容节点">2.2 什么时候CA缩容节点？</h4>
+<p>当该节点上的Pod resource requests低于用户定义的阈值（默认为50％节点资源利用率）时，将开始检查该节点是否可以安全删除。需要注意的是，节点缩减检查不考虑实际的CPU/MEM使用情况，而是仅查看调度到该节点上的所有Pod的resource requests。一旦通过检查发现节点的资源利用率过低，就会调用实际的Kubernetes调度算法，确定在该节点上运行的Pod是否可以迁移到其他节点,最后群集通过autoscaling group缩容。</p>
+<p>以上是kubernetes扩容所容相关的基本原理，那么在AWS(或者其他云，大同小异)上，我们是如何做到弹性伸缩的？</p>
+<h2 id="二-aws上实践">二. AWS上实践</h2>
+<h3 id="1-hpa实践">1. HPA实践</h3>
+<p>前提：</p>
+<p>-pod资源必须根据实际情况设置 requests 和 limit，分一下几种情况讨论扩容缩容时遇到的情况<br>
+1）如果没有resource requests，容易造成scheduler调度不合理，pod的资源无限制扩张，有可能造成node内存被挤爆，造成宕机；<br>
+2）仅设置了resource requests，此时limit默认等于requests如果pod内存增长到到requests，pod内容器OOM，影响业务稳定;pod的CPU达到limit则仅会使得程序变慢，不会OOM；<br>
+3）合理根据压测结果和长期监控dashboard曲线图设置request,limit设置比requests高10%~20%</p>
+<ul>
+<li>pod探针必须有readiness探针<br>
+HPA设置后，pod的数量会增多或者减少。设置readiness探针会使pod内的应用在完全起来时，才会接收请求，有助于服务稳定。</li>
+</ul>
+<h4 id="那么hpa的指标和阈值该如何定">那么，HPA的指标和阈值该如何定？</h4>
+<ul>
+<li>
+<p>内部指标<br>
+kubernetes内部指标有CPU/MEM/DISK，通常会使用CPU/MEM来做HPA的指标，这两个指标来自metrics-server ,直接或间接都会体现当前应用的繁忙程度。阈值建议在resource request上下浮动，原则是不能超过limit。最好的结果是当current CPU/MEM达到阈值后，开始扩容分担压力，current CPU/MEM不再增加，甚至下降；缩容则相反；</p>
+</li>
+<li>
+<p>外部指标<br>
+某些应用可能对CPU和MEM不敏感，比如消息模型的消费者对延时的消息数量敏感，这就需要外部和自定义的指标。这些指标接口有：metrics.k8s.io, custom.metrics.k8s.io, and external.metrics.k8s.io，首先推荐prometheus-adapter,它可以把来自prometheus的监控指标转换成kubernets可用的指标。比如prometheus监控到kafka的lag(延时消息数量)很多，通过这个指标扩容消费者pod的数量，可以减缓业务压力。</p>
+</li>
+</ul>
+<h3 id="2-cluster-autoscaling实践">2. Cluster Autoscaling实践</h3>
+<p>具体实现项目可参考这些<a href="https://kubedex.com/autoscaling/">扩容项目</a><br>
+我推荐使用kubernetes官方项目<a href="https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler">autoscaler</a><br>
+autoscaler会和AWS autoscaling group结合，定时检查集群资源使用情况，自动完成扩容缩容。<br>
+步骤1：添加auto scaling NodeGroup IAM role的权限</p>
+<pre><code>{
+    &quot;Version&quot;: &quot;2012-10-17&quot;,
+    &quot;Statement&quot;: [
+        {
+            &quot;Effect&quot;: &quot;Allow&quot;,
+            &quot;Action&quot;: [
+                &quot;autoscaling:DescribeAutoScalingGroups&quot;,
+                &quot;autoscaling:DescribeAutoScalingInstances&quot;,
+                &quot;autoscaling:DescribeLaunchConfigurations&quot;,
+                &quot;autoscaling:SetDesiredCapacity&quot;,
+                &quot;autoscaling:TerminateInstanceInAutoScalingGroup&quot;
+            ],
+            &quot;Resource&quot;: &quot;*&quot;
+        }
+    ]
+}
+</code></pre>
+<p>步骤2：安装cluster-autoscaler</p>
+<pre><code>$ helm install stable/cluster-autoscaler --name my-release --set &quot;autoscalingGroups[0].name=your-asg-name,autoscalingGroups[0].maxSize=10,autoscalingGroups[0].minSize=1&quot; --set nodeSelector.&quot;node-role\.kubernetes\.io/master&quot;=&quot;&quot; --set tolerations[0].effect=NoSchedule --set tolerations[0].key=node-role.kubernetes.io/master
+</code></pre>
+<p>这个时候可以增加一个deployment的replica去验证CA，直至有pod处于pending状态，看看是否有节点加入。<br>
+根据过往经验，AWS CA从pod处于pending状态触发扩容到新节点加入kubernetes集群在5min左右。<br>
+步骤3：安装k8s-spot-termination-handler<br>
+当AWS EC2实例准备终止时，其实例元数据会自动生成termination-time这个元数据。</p>
+<pre><code>$ curl -s http://169.254.169.254/latest/meta-data/spot/termination-time
+# 如果返回404，则表明当前节点不需要终止
+&lt;?xml version=&quot;1.0&quot; encoding=&quot;iso-8859-1&quot;?&gt;
+&lt;!DOCTYPE html PUBLIC &quot;-//W3C//DTD XHTML 1.0 Transitional//EN&quot;
+	&quot;http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd&quot;&gt;
+&lt;html xmlns=&quot;http://www.w3.org/1999/xhtml&quot; xml:lang=&quot;en&quot; lang=&quot;en&quot;&gt;
+ &lt;head&gt;
+  &lt;title&gt;404 - Not Found&lt;/title&gt;
+ &lt;/head&gt;
+ &lt;body&gt;
+  &lt;h1&gt;404 - Not Found&lt;/h1&gt;
+ &lt;/body&gt;
+&lt;/html&gt;
+</code></pre>
+<p>#如果返回200，并且有确切终止时间，则表明该节点大致在这个时间点终止。<br>
+2015-01-05T18:02:00Z<br>
+k8s-spot-termination-handler作为daemontset安装在每个节点上，当CA准备终止节点时，k8s-spot-termination-handler通过获取termination-time这个元数据知道节点即将终止，于是优雅驱逐该节点上的Pod<br>
+安装</p>
+<pre><code>helm install stable/k8s-spot-termination-handler --namespace kube-system
+</code></pre>
+<h3 id="总结">总结</h3>
+<p>从以上可以看出，HPA的指标除了内部的CPU/MEM，也可以根据需求自定义；需要合理设置pod资源的requests/limit，HPA CPU/MEM阈值不可超过资源的limit，否则无意义。<br>
+CA与HPA密切关联，其最理想的触发指标是pod的pending状态。<br>
+合理的配置资源限制和HPA，能使节点资源利用更合理，加上CA这道利器，使得系统能稳定扛住更大的流量并发。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[通过Prometheus webhook重启kafka消费者应用]]></title>
+        <id>https://moruikang.github.io/post/tong-guo-prometheus-webhook-chong-qi-kafka-xiao-fei-zhe-ying-yong/</id>
+        <link href="https://moruikang.github.io/post/tong-guo-prometheus-webhook-chong-qi-kafka-xiao-fei-zhe-ying-yong/">
+        </link>
+        <updated>2020-01-05T13:57:32.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一-简介">一. 简介</h2>
+<p>在kafka消息队列模型里，有几个概念：</p>
+<ul>
+<li>Producer: 生产者 负责生产、发布消息到Kafka broker</li>
+<li>Broker: 用来实现数据存储的主机服务器,即kafka应用本身</li>
+<li>Consumer、ConsumerGroup: Consumer是消息消费者，向Kafka broker读取消息的客户端，每个- Consumer属于一个特定的Consumer Group（可为每个Consumer指定group name，若不指定group name则属于默认的group）<br>
+一个Consumer即是一个应用，其会主动去kafka指定的topic订阅，并消费消息，完成后commit。ConsumerGroup即同样作用的一组应用。</li>
+</ul>
+<p>当消费者程序处理不当，容易造成停止消费消息，监控里会发现kafka consumergroup lag (latency，消费者落后于生产者的消息数)指标会一直显示有消息堆积，如果业务量大，可能会造成很大的损失。</p>
+<h2 id="二-临时方案-重启消费者应用">二. 临时方案-重启消费者应用</h2>
+<p>我们遇到的情况，一开始开发人员也很难定位到代码问题，只知道是服务出现假死。所以给出的临时方案是：定时重启。<br>
+可是问题来了：<br>
+定时是定在什么时候？<br>
+即便是定时了，告警出来就不用去手动重启消费者应用了嘛？<br>
+这是一个很糟糕的方案。</p>
+<h4 id="优化后的方案">优化后的方案</h4>
+<p>我们的应用都部署在kubernetes里，监控系统使用Prometheus,于是想通过Prometheus Webhook，当监控到kafka lag堆积时触发webhook，去删除对应消费者的pod。但这种做法治标不治本，只是在某些场景下作为临时方案，最终还是需要找到问题的根因。</p>
+<h2 id="三-prometheus-webhook介绍">三. Prometheus webhook介绍</h2>
+<p>prometheus Alertmanager 支持webhook，触发时，Alertmanager将以以下JSON格式向配置的webhook端点发送HTTP POST请求：</p>
+<pre><code>{
+  &quot;version&quot;: &quot;4&quot;,
+  &quot;groupKey&quot;: &lt;string&gt;,    // key identifying the group of alerts (e.g. to deduplicate)
+  &quot;status&quot;: &quot;&lt;resolved|firing&gt;&quot;,
+  &quot;receiver&quot;: &lt;string&gt;,
+  &quot;groupLabels&quot;: &lt;object&gt;,
+  &quot;commonLabels&quot;: &lt;object&gt;,
+  &quot;commonAnnotations&quot;: &lt;object&gt;,
+  &quot;externalURL&quot;: &lt;string&gt;,  // backlink to the Alertmanager.
+  &quot;alerts&quot;: [
+    {
+      &quot;status&quot;: &quot;&lt;resolved|firing&gt;&quot;,
+      &quot;labels&quot;: &lt;object&gt;,
+      &quot;annotations&quot;: &lt;object&gt;,
+      &quot;startsAt&quot;: &quot;&lt;rfc3339&gt;&quot;,
+      &quot;endsAt&quot;: &quot;&lt;rfc3339&gt;&quot;,
+      &quot;generatorURL&quot;: &lt;string&gt; // identifies the entity that caused the alert
+    },
+    ...
+  ]
+}
+</code></pre>
+<p>当发生消息积压告警时，触发告警，通过webhook向我们的服务发送接口请求，重启消费者应用。</p>
+<h2 id="四-代码实现和配置">四. 代码实现和配置</h2>
+<h4 id="1-代码">1. 代码</h4>
+<p>使用python flask 去做webhook扩展，当kafka lag堆积，alertmanager触发webhook，发送post请求到flask。</p>
+<pre><code>#!/usr/bin/python
+# -*- coding: utf-8 -*-
+
+from flask import Flask, request, jsonify
+import json
+
+import subprocess
+import logging
+
+
+logging.basicConfig(level=logging.DEBUG,
+                    datefmt='%Y-%m-%d %H:%M:%S',
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('prometheus-webhook')
+
+def delete_pod():
+    try:
+        logger.info(&quot;/usr/bin/kubectl delete po -l backend=pod-labels&quot;)
+        p = subprocess.Popen(
+            [&quot;export KUBECONFIG=~/.kube/config &amp;&amp; /usr/local/bin/kubectl delete po -l backend=pod-labels&quot;], \
+                             stdout=subprocess.PIPE, shell=True)
+        outs, errs = p.communicate()
+        logger.info(outs)
+    except Exception as e:
+        logger.info(e)
+
+
+app = Flask(__name__)
+
+@app.route('/delete/pod', methods=['POST'])
+def delete():
+    # TO DO
+    # 校验
+    try:
+        data = json.loads(request.get_data())
+        alerts = data['alerts']
+        logger.info(alerts)
+        for i in alerts:
+            if i['labels']['consumergroup'] == 'kafka-user-notification-group' \
+                    and i['status'] == 'firing':
+                delete_pod()
+                response = {&quot;status&quot;: &quot;succeed&quot;}
+                logger.info(&quot;delete kafka-user-notification-group pod&quot;)
+            else:
+                logger.info(&quot;kafka-user-notification-group alert's status has resolved&quot;)
+                response = {&quot;status&quot;: &quot;succeed&quot;}
+    except Exception as e:
+        logger.info(e)
+        response = {&quot;status&quot;: &quot;failure&quot;}
+
+    return jsonify(response)
+
+if __name__ == '__main__':
+
+    app.run(host='0.0.0.0', port=8081)
+</code></pre>
+<h4 id="2-alertmanager配置">2. alertmanager配置</h4>
+<pre><code>  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      group_by: ['alertname']
+      group_wait: 30s
+      group_interval: 1m
+      repeat_interval: 1h
+      receiver: 'alert'
+      routes:
+      - match:
+          severity: 'critical'
+          consumergroup: 'kafka-user-your-group'
+        receiver: 'webhook'
+        continue: true  # 设置为true，除了触发webhook之外还继续发出告警
+   receivers:
+      - name: 'webhook'
+        webhook_configs:
+        - url: 'http://host:8081/delete/pod'
+          send_resolved: true
+</code></pre>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[使用Kops和Terraform在AWS部署Kubernetes高可用集群]]></title>
+        <id>https://moruikang.github.io/post/shi-yong-kops-he-terraform-zai-aws-bu-shu-kubernetes-gao-ke-yong-ji-qun/</id>
+        <link href="https://moruikang.github.io/post/shi-yong-kops-he-terraform-zai-aws-bu-shu-kubernetes-gao-ke-yong-ji-qun/">
+        </link>
+        <updated>2020-01-03T13:46:49.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一介绍">一.介绍</h2>
+<p>Kops是一个命令行工具，可用于在AWS上部署符合生产要求的Kubernetes集群。它具有创建跨越多个可用性区域的高可用性群集的能力，并支持专用网络拓扑。默认情况下，Kops将在AWS建立kubernetes所有需要的资源EC2，VPC和子网，并在Route53添加DNS解析记录，使用AWS负载平衡器(ELB)暴露Kubernetes API，和其他需要的基础设施组件。<br>
+Terraform是用来管理云上基础架构的工具，它的理念是基础设施即代码，使用代码来配置和管理任何云资源</p>
+<h2 id="二架构">二.架构</h2>
+<figure data-type="image" tabindex="1"><img src="https://moruikang.github.io/post-images/1739886645055.jpg" alt="" loading="lazy"></figure>
+<h2 id="三创建集群">三.创建集群</h2>
+<h4 id="提前准备">提前准备</h4>
+<ul>
+<li>AWS Administrator account</li>
+<li>GoDaddy账号</li>
+</ul>
+<h3 id="1-创建aws-iamroute53">1. 创建AWS IAM，Route53</h3>
+<p>详见Kops文档</p>
+<h4 id="11-创建iam用户">1.1 创建IAM用户</h4>
+<p>为了在AWS内构建集群，需要创建一个专用的IAM用户kops。这个用户需要API凭据才能使用kops。使用AWS控制台创建用户并下载ACCESS KEY和SECRET凭证(请自行在AWS IAM控制台执行创建操作)。<br>
+这个kops用户需要以下IAM权限：</p>
+<ul>
+<li>AmazonEC2FullAccess</li>
+<li>AmazonRoute53FullAccess</li>
+<li>AmazonS3FullAccess</li>
+<li>IAMFullAccess</li>
+<li>AmazonVPCFullAccess<br>
+创建kops用户并下载ACCESS KEY和SECRET凭证后<br>
+执行</li>
+</ul>
+<pre><code># 使用上一步保存的ACCESS KEY和SECRET，配置aws cli 
+$ aws configure
+$ export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+$ export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+</code></pre>
+<h4 id="12-配置route-53">1.2 配置Route 53</h4>
+<p>为什么需要操作这一步？<br>
+因为kops创建k8s集群需要一个域名，这个域名的ns(namespace)托管在Route53后，Kops可以在AWS可以创建一些子域名分别指向不同应用服务</p>
+<pre><code>api.internal.xxx.com =&gt; k8s master
+etcd-x.internal.xxx.com =&gt; etcd 
+api.xxx.com =&gt; k8s api-server
+bastion.xxx.com =&gt; k8s bastion
+...
+</code></pre>
+<p>创建AWS Route53托管区域</p>
+<pre><code># subdomain.example.com是你在godaddy(或者别的域名商)的域名
+$ ID=$(uuidgen) &amp;&amp; aws route53 create-hosted-zone --name subdomain.example.com --caller-reference $ID | \
+    jq .DelegationSet.NameServers
+</code></pre>
+<p>生成:<br>
+<img src="https://moruikang.github.io/post-images/1739886679173.jpg" alt="" loading="lazy"></p>
+<p>记录下来 AWS Route53托管区域ID 下一步会需要到</p>
+<pre><code>$ aws route53 list-hosted-zones | jq '.HostedZones[] | select(.Name==&quot;example.com.&quot;) | .Id'
+# 输出结果类似以下内容:
+{
+  &quot;Comment&quot;: &quot;Create a subdomain NS record in the parent domain&quot;,
+  &quot;Changes&quot;: [
+    {
+      &quot;Action&quot;: &quot;CREATE&quot;,
+      &quot;ResourceRecordSet&quot;: {
+        &quot;Name&quot;: &quot;subdomain.example.com&quot;,
+        &quot;Type&quot;: &quot;NS&quot;,
+        &quot;TTL&quot;: 300,
+        &quot;ResourceRecords&quot;: [
+          {
+            &quot;Value&quot;: &quot;ns-1.awsdns-1.co.uk&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-2.awsdns-2.org&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-3.awsdns-3.com&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-4.awsdns-4.net&quot;
+          }
+        ]
+      }
+    }
+  ]
+}
+</code></pre>
+<p>最后在godaddy那边对该域名添加以上4条ns记录(value字段的4条内容)<br>
+本地验证ns是否生效</p>
+<pre><code>$ dig NS subdomain.example.com +short
+#输出结果应该为以上添加的4条ns记录
+</code></pre>
+<h3 id="2-创建vpc网络和kubernetes集群">2. 创建VPC网络和kubernetes集群</h3>
+<pre><code>$ git clone https://github.com/ryane/kubernetes-aws-vpc-kops-terraform.git
+$ cd kubernetes-aws-vpc-kops-terraform
+$ export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+$ export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+
+#创建terraform集群配置
+$ cat &lt;&lt;EOF  &gt; subdomain.example.com.tfvars
+name=&quot;example.com&quot;
+region=&quot;ap-southeast-1&quot; 
+azs=[&quot;ap-southeast-1a&quot;,&quot;ap-southeast-1b&quot;,&quot;ap-southeast-1c&quot;]
+env=&quot;prod&quot;
+vpc_cidr=&quot;10.3.0.0/16&quot;
+EOF
+$ ls
+README.md   main.tf   outputs.tf    subdomain.example.com.tfvars variables.tf   gensubnets  modules override.tf update-zone.json
+</code></pre>
+<p>可以看到，这里都是项目的terraform代码。<br>
+一切准备妥当，可以开始创建vpc了</p>
+<pre><code>$ terraform init  # 初始化代码，下载依赖包国内网络会有点久，翻墙好点
+$ terraform plan -var-file=subdomain.example.com.tfvars  #建议所有操作有预执行一遍
+$ terraform apply -var-file=subdomain.example.com.tfvars -auto-approve
+</code></pre>
+<p>完成创建VPC， 去到AWS VPC控制台，会看到创建的VPC,6个子网，4个路由表，3个私网的NAT网关等等<br>
+下一步开始我们的主题，创建kubernetes集群</p>
+<pre><code>$ export NAME=$(terraform output cluster_name)
+$ export KOPS_STATE_STORE=$(terraform output state_store)
+$ export ZONES=$(terraform output -json availability_zones | jq -r '.value|join(&quot;,&quot;)')
+$ export MASTER_SIZE=${MASTER_SIZE:-m5.large}
+$ export NODE_SIZE=${NODE_SIZE:-m5.xlarge}
+
+$ kops create cluster \
+    --associate-public-ip=false \
+    --bastion \
+    --master-count 3 \
+    --master-size $MASTER_SIZE \
+    --master-zones $ZONES \
+    --zones $ZONES \
+    --topology private \
+    --dns-zone Z25xxxxxxxx4U6 \  #这里输入前面route53生成的托管区域id
+    --networking amazon-vpc-routed-eni \  # 选择aws提供的k8s cni
+    --network-cidr 10.3.0.0/16 \
+    --node-count 1 \
+    --node-size $NODE_SIZE \
+    --vpc $(terraform output vpc_id) \
+    --ssh-access 0.0.0.0/0 \  #建议输入你的本地公网ip地址
+    --target=terraform \
+    --out=. \
+    ${NAME}
+</code></pre>
+<pre><code># 导出子网设置,记录下来，后续需要修改cluster子网设置
+$ terraform output -json | docker run --rm -i ryane/gensubnets:0.1
+# 把以上输出子网信息复制下来
+$ kops get cluster ${NAME} -o yaml &gt; cluster.yaml  #备份集群yaml
+$ kops edit cluster ${NAME}
+# 修改前的子网部分应该类似如下：
+subnets:
+- cidr: 10.20.32.0/19
+  name: us-east-1a
+  type: Private
+  zone: us-east-1a
+- cidr: 10.20.64.0/19
+  name: us-east-1c
+  type: Private
+  zone: us-east-1c
+- cidr: 10.20.96.0/19
+  name: us-east-1d
+  type: Private
+  zone: us-east-1d
+- cidr: 10.20.0.0/22
+  name: utility-us-east-1a
+  type: Utility
+  zone: us-east-1a
+- cidr: 10.20.4.0/22
+  name: utility-us-east-1c
+  type: Utility
+  zone: us-east-1c
+- cidr: 10.20.8.0/22
+  name: utility-us-east-1d
+  type: Utility
+  zone: us-east-1d
+#使用前一步的子网输出信息，替换*subnets* 模块里的子网内容，替换后应该类似如下：
+subnets:
+- egress: nat-0b2f7f77b15041515
+  id: subnet-8db395d6
+  name: us-east-1a
+  type: Private
+  zone: us-east-1a
+- egress: nat-059d239e3f86f6da9
+  id: subnet-fd6b41d0
+  name: us-east-1c
+  type: Private
+  zone: us-east-1c
+- egress: nat-0231eef9a93386f4a
+  id: subnet-5fc6dd16
+  name: us-east-1d
+  type: Private
+  zone: us-east-1d
+- id: subnet-0ab39551
+  name: utility-us-east-1a
+  type: Utility
+  zone: us-east-1a
+- id: subnet-656b4148
+  name: utility-us-east-1c
+  type: Utility
+  zone: us-east-1c
+- id: subnet-cdc7dc84
+  name: utility-us-east-1d
+  type: Utility
+  zone: us-east-1d
+# 更新修改
+$ kops update cluster \
+  --out=. \
+  --target=terraform \
+  ${NAME}
+$ terraform plan -var-file=subdomain.example.com.tfvars
+$ terraform apply -var-file=subdomain.example.com.tfvars -auto-approve
+</code></pre>
+<p>这样子，整个k8s集群都部署完成。<br>
+kubeconfig自动生成在你本地~/.kube/config， bastion节点的登陆私钥默认是~/.ssh/id_rsa(kops创建集群的时候可以使用--ssh-public-key参数指定公钥)</p>
+<pre><code>$ kops get instancegroups
+NAME                    ROLE    MACHINETYPE     MIN     MAX     ZONES
+bastions                Bastion t2.micro        1       1       ap-southeast-1a
+master-ap-southeast-1a  Master  m5.xlarge       1       1       ap-southeast-1a
+master-ap-southeast-1b  Master  m5.xlarge       1       1       ap-southeast-1b
+master-ap-southeast-1c  Master  m5.xlarge       1       1       ap-southeast-1c
+nodes                   Node    m5.xlarge       3       20      ap-southeast-1a,ap-southeast-1b,ap-southeast-1c
+</code></pre>
+<p>切换到aws Route53控制台，可以发现有2条对外的域名，分别是:<br>
+api.subdomain.example.com(dns指向bastion节点的Load Balancer，查看kubeconfig内容，该域名即为apiserver)<br>
+bastion.subdomain.example.com(dns指向k8s master节点的Load Balancer）<br>
+修改这两个域名的访问ip控制，可从对应的Load Balancer安全组修改。</p>
+<p>切换到AWS S3控制台信息，可以看到多了一个S3 bucket， 这个S3 Bucket是用来存储kops k8s集群信息的。<br>
+切换到AWS EC2控制台，发现auto scaling多了5个组，分别对应kops get instancegroups的内容。<br>
+切换到AWS IAM，发现kops为每一个instancegroup都创建了对应的role角色权限。<br>
+清除所有基础资源</p>
+<pre><code>$ terraform destroy
+</code></pre>
+<h4 id="建议">建议:</h4>
+<ul>
+<li>以后所有的基础资源改动，都经过terraform，不需要手动在AWS控制台修改，否则下次terraform执行引起冲突</li>
+<li>对于k8s集群，如果需要扩大集群节点的CIDR块，在创建集群前，可修改代码里的(位置：modules/subnet-pair/variables.tf）newbits，默认是8，改小可以扩大CIDR块。</li>
+</ul>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[Prometheus全面监控kafka集群]]></title>
+        <id>https://moruikang.github.io/post/prometheus-quan-mian-jian-kong-kafka-ji-qun/</id>
+        <link href="https://moruikang.github.io/post/prometheus-quan-mian-jian-kong-kafka-ji-qun/">
+        </link>
+        <updated>2020-01-01T13:17:51.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一-简介">一. 简介</h2>
+<p>网上看到很多使用Prometheus监控kafka集群的文章，但大多都不够详细，思来想去还是自己写一篇。<br>
+一般经验法则是：“收集所有可能/合理的指标，这些指标在故障排除时会有所帮助”。</p>
+<h4 id="如何使用prometheus监控kafka">如何使用Prometheus监控kafka？</h4>
+<p>kafka的组件如图：<br>
+<img src="https://moruikang.github.io/post-images/1739884878796.png" alt="" loading="lazy"></p>
+<p>我们这里把kafka监控分成三大类：</p>
+<ul>
+<li>node exporter：broker系统指标</li>
+<li>JMX exporter: JMX指标</li>
+<li>kafka exporter：生产者/消费者指标</li>
+</ul>
+<h2 id="二-部署监控">二. 部署监控</h2>
+<h3 id="21-部署node-exporter监控系统级指标">2.1 部署node exporter，监控系统级指标</h3>
+<p>安装 node_exporter</p>
+<pre><code>$ sudo useradd --no-create-home --shell /bin/false node_exporter
+$ curl -fsSL https://github.com/prometheus/node_exporter/releases/download/v0.17.0/node_exporter-0.17.0.linux-amd64.tar.gz \
+  | sudo tar -zxvf - -C /usr/local/bin --strip-components=1 node_exporter-0.17.0.linux-amd64/node_exporter \
+  &amp;&amp; sudo chown node_exporter:node_exporter /usr/local/bin/node_exporter
+$ sudo tee /etc/systemd/system/node_exporter.service &lt;&lt;&quot;EOF&quot;
+[Unit]
+Description=Node Exporter
+
+[Service]
+User=node_exporter
+Group=node_exporter
+EnvironmentFile=-/etc/sysconfig/node_exporter
+ExecStart=/usr/local/bin/node_exporter $OPTIONS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$ sudo systemctl daemon-reload &amp;&amp; \
+sudo systemctl start node_exporter &amp;&amp; \
+sudo systemctl status node_exporter &amp;&amp; \
+sudo systemctl enable node_exporter
+$ curl localhost:9100/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-cluster'
+    static_configs:
+      - targets: ['192.168.2.xx:9100']
+      - targets: ['192.168.2.xx:9100']
+      - targets: ['192.168.2.xx:9100']
+</code></pre>
+<p>推荐使用的[Grafana node dashboard] (https://github.com/moruikang/prometheus-grafana/tree/master/Kubernetes-nodes)<br>
+<img src="https://moruikang.github.io/post-images/1739885956273.jpg" alt="" loading="lazy"><br>
+主机指标</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Metrics</th>
+<th style="text-align:center">说明</th>
+<th style="text-align:center">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">内存使用率</td>
+<td style="text-align:center">Kafka完全在RAM上运行。JVM内存设置大小不应大于可用的RAM。</td>
+<td style="text-align:center">&gt;85%</td>
+</tr>
+<tr>
+<td style="text-align:center">Swap使用率</td>
+<td style="text-align:center">注意Swap使用情况，内存不足时kafka会使用Swap,但它会降低Kafka的性能并导致操作超时</td>
+<td style="text-align:center">swap&gt; 128M</td>
+</tr>
+<tr>
+<td style="text-align:center">网络带宽</td>
+<td style="text-align:center">Kafka服务器依赖网络带宽。需要密切注意这一点，尤其是性能下降时。另外还要注意丢包率</td>
+<td style="text-align:center">None</td>
+</tr>
+<tr>
+<td style="text-align:center">磁盘使用率</td>
+<td style="text-align:center">确保随时都有足够的磁盘空间</td>
+<td style="text-align:center">&gt;85%</td>
+</tr>
+<tr>
+<td style="text-align:center">磁盘IO</td>
+<td style="text-align:center">Kafka中的磁盘是顺序的读写的</td>
+<td style="text-align:center">None</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-部署jmx-exporter监控jmx指标">2.2 部署jmx exporter，监控JMX指标</h3>
+<p>安装jmx_exporter到kafka安装目录(例如/opt/kafka_2.11-2.0.0)</p>
+<pre><code>$ wget https://repo1.maven.org/maven2/io/prometheus/jmx/jmx_prometheus_javaagent/0.12.0/jmx_prometheus_javaagent-0.12.0.jar
+$ wget https://raw.githubusercontent.com/prometheus/jmx_exporter/master/example_configs/kafka-2_0_0.yml
+$ vim bin/kafka-server-start.sh
+#在文件开始处添加
+export KAFKA_OPTS=&quot;-javaagent:/opt/kafka_2.11-2.0.0/jmx_prometheus_javaagent-0.11.0.jar=9990:/opt/kafka_2.11-2.0.0/kafka-2_0_0.yml&quot;
+</code></pre>
+<p>重启kafka<br>
+验证指标:</p>
+<pre><code>$ curl localhost:9990/metrics
+Prometheus添加配置：
+
+scrape_configs:
+  - job_name: 'kafka-jmx-exporter'
+    static_configs:
+      - targets: ['192.168.2.xx:9990']
+      - targets: ['192.168.2.xx:9990']
+      - targets: ['192.168.2.xx:9990']
+</code></pre>
+<p>推荐使用的<a href="https://grafana.com/grafana/dashboards/721">Grafana kafka jmx exporter dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1739885966500.jpg" alt="" loading="lazy"></p>
+<p>JMX指标：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Metrics</th>
+<th style="text-align:center">说明</th>
+<th style="text-align:center">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">kafka_server_replicamanager_underreplicatedpartitions</td>
+<td style="text-align:center">未复制的分区数</td>
+<td style="text-align:center">&gt;0</td>
+</tr>
+<tr>
+<td style="text-align:center">kafka_controller_kafkacontroller_offlinepartitionscount</td>
+<td style="text-align:center">没有存活leader的分区数，这些分区不可读也不可写</td>
+<td style="text-align:center">&gt;0</td>
+</tr>
+<tr>
+<td style="text-align:center">kafka_controller_kafkacontroller_activecontrollercount</td>
+<td style="text-align:center">存活的active controller brokers</td>
+<td style="text-align:center">!=1</td>
+</tr>
+<tr>
+<td style="text-align:center">kafka_server_brokertopicmetrics_messagesin_total</td>
+<td style="text-align:center">每秒传入的消息</td>
+<td style="text-align:center">None</td>
+</tr>
+<tr>
+<td style="text-align:center">bytesin_total/bytesout_total</td>
+<td style="text-align:center">每秒传入/传出字节</td>
+<td style="text-align:center">None</td>
+</tr>
+<tr>
+<td style="text-align:center">RequestsPerSec</td>
+<td style="text-align:center">{Produce/FetchConsumer/FetchFollower} - 每秒请求数</td>
+<td style="text-align:center">None</td>
+</tr>
+<tr>
+<td style="text-align:center">TotalTimeMs</td>
+<td style="text-align:center">{Produce/FetchConsumer/FetchFollower} – 处理一次请求时间</td>
+<td style="text-align:center">None</td>
+</tr>
+<tr>
+<td style="text-align:center">kafka_controller_controllerstats_uncleanleaderelections_total</td>
+<td style="text-align:center">有问题的leader选举次数</td>
+<td style="text-align:center">!=0</td>
+</tr>
+<tr>
+<td style="text-align:center">kafka_server_replicamanager_partitioncount</td>
+<td style="text-align:center">集群的分区数</td>
+<td style="text-align:center">!= 你的分区数</td>
+</tr>
+<tr>
+<td style="text-align:center">isrshrinks / isrexpands</td>
+<td style="text-align:center">当broker崩溃时，partition的ISR将缩小。当broker恢复后，当replica全部同步数据后，分区的ISR将扩展。</td>
+<td style="text-align:center">!=0</td>
+</tr>
+<tr>
+<td style="text-align:center">kafka_network_socketserver_networkprocessoravgidlepercent</td>
+<td style="text-align:center">网络处理器的平均空闲时间</td>
+<td style="text-align:center">&lt; 0.3</td>
+</tr>
+<tr>
+<td style="text-align:center">kafka_server_kafkarequesthandlerpool_requesthandleravgidlepercent_count</td>
+<td style="text-align:center">处理请求线程的平均空闲时间</td>
+<td style="text-align:center">&lt; 0.3</td>
+</tr>
+<tr>
+<td style="text-align:center">jvm_memory_bytes_used</td>
+<td style="text-align:center">Java进程动态分配的内存</td>
+<td style="text-align:center">None</td>
+</tr>
+</tbody>
+</table>
+<h3 id="23-部署kafka-exporter监控消费者指标">2.3 部署kafka exporter，监控消费者指标</h3>
+<p>安装kafka_exporter</p>
+<pre><code>$ sudo useradd --no-create-home --shell /bin/false kafka_exporter
+$ curl -fsSL https://github.com/danielqsj/kafka_exporter/releases/download/v1.2.0/kafka_exporter-1.2.0.linux-amd64.tar.gz | \
+sudo tar -zxvf - -C /usr/local/bin --strip-components=1 kafka_exporter-1.2.0.linux-amd64/kafka_exporter  &amp;&amp; \
+sudo chown kafka_exporter:kafka_exporter /usr/local/bin/kafka_exporter
+$ sudo tee /etc/systemd/system/kafka_exporter.service &lt;&lt;&quot;EOF&quot;
+[Unit]
+Description=Kafka Exporter
+
+[Service]
+User=kafka_exporter
+Group=kafka_exporter
+EnvironmentFile=-/etc/sysconfig/kafka_exporter
+ExecStart=/usr/local/bin/kafka_exporter $OPTIONS
+
+[Install]
+WantedBy=multi-user.target
+EOF
+$ sudo mkdir -p /etc/sysconfig &amp;&amp; sudo tee /etc/sysconfig/kafka_exporter &lt;&lt;&quot;EOF&quot;
+OPTIONS=&quot;--kafka.server=localhost:9092&quot; # kafka host:port
+EOF
+$ sudo systemctl daemon-reload &amp;&amp; \
+sudo systemctl start kafka_exporter &amp;&amp; \
+sudo systemctl status kafka_exporter &amp;&amp; \
+sudo systemctl enable kafka_exporter
+$ curl localhost:9308/metrics
+</code></pre>
+<p>Prometheus添加配置：</p>
+<pre><code>scrape_configs:
+  - job_name: 'kafka-exporter'
+    static_configs:
+      - targets: ['192.168.2.xx:9308']
+</code></pre>
+<p>推荐使用的<a href="https://github.com/danielqsj/kafka_exporter/releases">Grafana kafka exporter overview dashboard</a><br>
+<img src="https://moruikang.github.io/post-images/1739885982264.jpg" alt="" loading="lazy"><br>
+kafka exporter指标：</p>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">Metrics</th>
+<th style="text-align:center">说明</th>
+<th style="text-align:center">建议告警阈值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">kafka_consumergroup_lag</td>
+<td style="text-align:center">消费者落后于生产者的消息数</td>
+<td style="text-align:center">&gt; 20</td>
+</tr>
+</tbody>
+</table>
+<p>如果使用helm部署kafka exporter里可以考虑我自己简单写的<a href="https://github.com/moruikang/kafka-exporter-helm">helm chart</a><br>
+备注：从github查找，截止到博客发布时间，发现官方未出版kafka exporter helm chart</p>
+<h2 id="三-kafka黑盒监控">三. kafka黑盒监控</h2>
+<p>在集群上建立一个专门的topic, 监控程序实时的写入数据, 当无法写入或写入耗时达到阈值时报警, 基本上都第一时间发现问题。</p>
+]]></content>
+    </entry>
+    <entry>
+        <title type="html"><![CDATA[生产环境kafka集群的搭建]]></title>
+        <id>https://moruikang.github.io/post/sheng-chan-huan-jing-kafka-ji-qun-de-da-jian/</id>
+        <link href="https://moruikang.github.io/post/sheng-chan-huan-jing-kafka-ji-qun-de-da-jian/">
+        </link>
+        <updated>2020-01-01T12:17:31.000Z</updated>
+        <content type="html"><![CDATA[<h2 id="一kafka介绍">一.kafka介绍</h2>
+<p>Kafka是由Apache软件基金会开发的一个开源流处理平台，由Scala和Java编写。该项目的目标是为处理实时数据提供一个统一、高吞吐、低延迟的平台。</p>
+<h3 id="特点">特点</h3>
+<ul>
+<li>顺序读写磁盘，高吞吐量</li>
+<li>本地持久化消息</li>
+<li>分布式消息系统</li>
+</ul>
+<h3 id="架构">架构</h3>
+<p><img src="https://moruikang.github.io/post-images/1739881268313.png" alt="" loading="lazy"><br>
+Kafka架构的主要术语包括Producer、 Consumer、Topic、Partition和Broker。</p>
+<p>Producer: 负责发布消息到Kafka broker<br>
+Consumer、ConsumerGroup: Consumer是消息消费者，向Kafka broker读取消息的客户端，每个Consumer属于一个特定的Consumer Group（可为每个Consumer指定group name，若不指定group name则属于默认的group）<br>
+Topic: 用来对消息进行分类，每个进入到Kafka的信息都会被放到一个Topic下<br>
+Partition: 每个Topic中的消息会被分为一个或多个Partition<br>
+<img src="https://moruikang.github.io/post-images/1739881313834.webp" alt="" loading="lazy"><br>
+Broker: 用来实现数据存储的主机服务器<br>
+Kafka中发布订阅的对象是topic。我们可以为每类数据创建一个topic；向topic发布消息的客户端称作producer，从topic订阅消息的客户端称作consumer。Producers和consumers可以同时从多个topic读写数据。一个kafka集群由一个或多个broker服务器组成，它负责持久化和备份kafka消息。</p>
+<h2 id="二部署">二.部署</h2>
+<h3 id="1部署服务器节点">1.部署服务器节点</h3>
+<figure data-type="image" tabindex="1"><img src="https://moruikang.github.io/post-images/1739881359823.jpg" alt="" loading="lazy"></figure>
+<h4 id="服务器环境">服务器环境</h4>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">节点</th>
+<th style="text-align:center">IP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">node1</td>
+<td style="text-align:center">192.168.2.43</td>
+</tr>
+<tr>
+<td style="text-align:center">node2</td>
+<td style="text-align:center">192.168.2.44</td>
+</tr>
+<tr>
+<td style="text-align:center">node3</td>
+<td style="text-align:center">192.168.2.45</td>
+</tr>
+</tbody>
+</table>
+<h4 id="系统和依赖">系统和依赖：</h4>
+<ul>
+<li>ubuntu 18.04</li>
+<li>java openjdk version &quot;1.8.0_222&quot; (自行安装)</li>
+</ul>
+<h3 id="2安装zookeeper">2.安装zookeeper</h3>
+<p>node1,node2,node3都要下载和安装<br>
+下载版本： https://archive.apache.org/dist/zookeeper/zookeeper-3.4.12/</p>
+<pre><code>$ cd /opt
+$ wget https://archive.apache.org/dist/zookeeper/zookeeper-3.4.12/zookeeper-3.4.12.tar.gz
+$ tar -zxvf  zookeeper-3.4.12.tar.gz
+$ cd zookeeper-3.4.12
+</code></pre>
+<p>修改配置：</p>
+<pre><code>$ vim conf/zoo.cfg 
+tickTime=2000
+initLimit=10
+syncLimit=5
+dataDir=/opt/zookeeper-3.4.12/data    ###根据实际情况修改
+dataLogDir=/opt/zookeeper-3.4.12/log  ###根据实际情况修改
+clientPort=2181
+server.1=192.168.2.43:2888:3888
+server.2=192.168.2.44:2888:3888
+server.3=192.168.2.45:2888:3888
+
+#server.1 这个1是服务器的标识也可以是其他的数字， 表示这个是第几号服务器，用来标识服务器，这个标识要写到快照目录下面myid文件里
+#192.168.2.43-45为集群里的IP地址，第一个端口是master和slave之间的通信端口，默认是2888，第二个端口是leader选举的端口，集群刚启动的时候选举或者leader挂掉之后进行重新选举的端口，默认是3888
+</code></pre>
+<h4 id="21-配置文件解释">2.1 配置文件解释：</h4>
+<p>#tickTime：<br>
+这个时间是作为Zookeeper服务器之间或客户端与服务器之间维持心跳的时间间隔，也就是每间隔 tickTime时间就会发送一个心跳。<br>
+#initLimit：<br>
+这个配置项是用来配置Zookeeper接受客户端（这里所说的客户端不是用户连接Zookeeper服务器的客户端，而是Zookeeper服务器集群中连接到Leader的Follower服务器）初始化连接时最长能忍受多少个心跳时间间隔数。当已经超过5个心跳的时间（也就是tickTime）长度后，Zookeeper服务器还没有收到客户端的返回信息，那么表明这个客户端连接失败。总的时间长度等于52000=10秒<br>
+#syncLimit：<br>
+这个配置项标识Leader与Follower之间发送消息，请求和应答时间长度，最长不能超过多少个tickTime的时间长度，总的时间长度就是52000=10秒<br>
+#dataDir：<br>
+快照日志的存储路径<br>
+#dataLogDir：<br>
+事务日志的存储路径，如果不配置这个，那么事务日志会默认存储到dataDir指定的目录，这会严重影响zk的性能，当zk吞吐量较大的时候，产生的事务日志、快照日志会很多。<br>
+#clientPort：<br>
+客户端连接Zookeeper服务器的端口，Zookeeper监听这个端口，接受客户端的访问请求。</p>
+<pre><code>#node1
+$ echo &quot;1&quot; &gt; /opt/zookeeper-3.4.12/data/myid 
+#node2
+$ echo &quot;2&quot; &gt; /opt/zookeeper-3.4.12/data/myid 
+#node3
+$ echo &quot;3&quot; &gt; /opt/zookeeper-3.4.12/data/myid 
+</code></pre>
+<p>创建zookerper.service的systemd系统守护进程<br>
+node1,node2,node3都需要操作</p>
+<pre><code>$ tee zookeeper.service &gt; /dev/null &lt;&lt;EOF
+[Unit]
+Description=ZooKeeper Service
+Documentation=http://zookeeper.apache.org
+Requires=network.target
+After=network.target
+[Service]
+Type=forking
+User=ubuntu
+Group=ubuntu
+ExecStart=/opt/zookeeper-3.4.12/bin/zkServer.sh start 
+ExecStop=/opt/zookeeper-3.4.12/bin/zkServer.sh stop 
+ExecReload=/opt/zookeeper-3.4.12/bin/zkServer.sh restart
+WorkingDirectory=/var/log/zookeeper
+EOF
+$ cp zookeeper.service  /etc/systemd/system/zookeeper.service
+$ systemctl enable zookeeper.service
+$ systemctl start zookeeper.service 
+$ systemctl status zookeeper.service 
+</code></pre>
+<pre><code>#进入到Zookeeper的bin目录下 （3台都需要操作）
+$ cd /opt/zookeeper-3.4.12/bin
+#检查服务状态 
+$ ./zkServer.sh status
+</code></pre>
+<h3 id="3-安装kafka">3. 安装kafka</h3>
+<h4 id="31-创建目录并下载安装软件">3.1 创建目录并下载安装软件</h4>
+<h5 id="安装目录">安装目录</h5>
+<pre><code>$ cd /opt
+#下载软件
+$ wget http://mirror.bit.edu.cn/apache/kafka/2.1.1/kafka_2.11-2.1.1.tgz #解压软件
+$ tar -zxvf kafka_2.11-2.1.1.tgz
+</code></pre>
+<h4 id="32-修改配置文件">3.2 修改配置文件</h4>
+<p>进入到config目录</p>
+<pre><code>$ cd /opt/kafka_2.11-2.1.1/config
+$ vim server.properties   
+broker.id=0 #当前机器在集群中的唯一标识，和zookeeper的myid性质一样，建议node1为0，node2为1，node3为2
+listeners=PLAINTEXT://192.168.2.43:9092 #kafka监听地址，根据本机ip填写
+num.network.threads=5 # borker进行网络处理的线程数,建议不大于CPU的2倍
+num.io.threads=10  # borker进行I/O处理的线程数
+socket.send.buffer.bytes=102400 #发送缓冲区buffer大小，数据不是一下子就发送的，先回存储到缓冲区了到达一定的大小后再发送，能提高性能
+socket.receive.buffer.bytes=102400 #kafka接收缓冲区大小，当数据到达一定大小后再序列化到磁盘
+socket.request.max.bytes=104857600 #向kafka请求消息或者向kafka发送消息的最大请求数，这个值不能超过java的堆栈大小
+log.dirs=/data/kafka-logs #消息存放的目录，多个目录使用&quot;,&quot;逗号分割，上面num.io.threads要大于目录的个数；如果配置多个目录，新创建的topic把消息持久化在当前目录列表中分区数最少的那个目录。
+num.partitions=6 #默认的分区数，默认1个分区数
+num.recovery.threads.per.data.dir=1
+log.retention.hours=168 #默认消息的最大持久化时间，168小时，7天
+log.segment.bytes=1073741824 #kafka的消息是以追加的形式存储到文件，当超过这个值的时候，kafka会新起一个文件
+log.retention.check.interval.ms=300000 #每隔300000毫秒去检查上面配置的log失效时间（log.retention.hours=168 ），到目录查看是否有过期的消息，如果有，删除
+offsets.topic.replication.factor=3 #kafka会把offset信息存在这个topic里面，当是集群部署时，这个副本数等于节点数
+zookeeper.connect=192.168.2.43:2181,192.168.2.44:2181,192.168.2.45:2181#设置zookeeper的连接端口
+message.max.byte=5242880
+default.replication.factor=3
+replica.fetch.max.bytes=5242880
+zookeeper.connection.timeout.ms=6000 #连接zookeeper的超时时间 
+auto.leader.rebalance.enable=true
+</code></pre>
+<p>创建zookerper.service的systemd系统守护进程<br>
+node1,node2,node3都需要操作</p>
+<pre><code>$ tee kafkals.service &gt; /dev/null &lt;&lt;EOF
+[Unit]
+Description=Apache Kafka server (broker)
+Documentation=http://kafka.apache.org/documentation.html
+Requires=network.target remote-fs.target
+After=network.target remote-fs.target zookeeper.service
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+ExecStart=/opt/kafka_2.11-2.1.1/bin/kafka-server-start.sh /opt/kafka_2.11-2.1.1/config/server.properties
+ExecStop=/opt/kafka_2.11-2.1.1/bin/kafka-server-stop.sh
+WorkingDirectory=/var/log/kafka
+[Install]
+WantedBy=multi-user.target
+EOF
+$ cp kafka.service  /etc/systemd/system/kafka.service
+$ systemctl enable kafka.service
+$ systemctl start kafka.service 
+$ systemctl status kafka.service 
+</code></pre>
+<h4 id="33-创建topic来验证是否创建成功">3.3 创建Topic来验证是否创建成功</h4>
+<pre><code>#创建Topic
+$ cd /opt/kafka_2.11-2.1.1/bin
+$ kafka-topics.sh --create --zookeeper 192.168.2.43:2181 --replication-factor 3 --partitions 6 --topic test
+#解释 --replication-factor 3 复制两份; --partitions 6 创建6个分区; --topic 主题为test 
+#在一台服务器上创建发布者
+$ kafka-console-producer.sh --broker-list 192.168.2.43:9092 --topic test   ###从这里输入发送的消息 
+</code></pre>
+<pre><code>#新开一个终端，创建一个消费者，接收消息
+kafka-console-consumer.sh --zookeeper 192.168.2.43:2181 --topic test --from-beginning
+</code></pre>
+<p>上面的完成之后可以登录zk来查看zk的目录情况</p>
+<pre><code>#使用客户端进入
+cd /opt/zookeeper-3.4.12/bin ./zkCli.sh 
+#查看目录情况 执行
+[zk: 192.168.2.43:2181(CONNECTED) 1] ls /  #查看目录
+[zk: 192.168.2.43:2181(CONNECTED) 1] get /brokers/ids/0 #查看broker
+</code></pre>
+<h4 id="34-日志说明">3.4 日志说明</h4>
+<p>默认kafka的日志保存在/opt/kafka/kafka_2.12-0.10.2.1/logs目录下，这里说几个需要注意的日志</p>
+<p>server.log #kafka的运行日志<br>
+state-change.log #kafka用zookeeper来保存状态，有可能会进行切换，切换的日志就保存在这里<br>
+controller.log #kafka选择一个节点作为“controller”,当发现有节点down掉的时候它负责在可用分区的所有节点中选择新的leader,这使得Kafka可以批量高效的管理所有分区节点的主从关系。如果controller down掉了，活着的节点中的一个会被切换为新的controller.</p>
+<h3 id="三-建议">三. 建议</h3>
+<ul>
+<li>kafka和zookeeper分开部署在单独节点，CPU选择IO优化，给足够的带宽</li>
+<li>kafka是IO类型，建议挂多块磁盘给不同partition</li>
+<li>partition分区数根据消费者来定</li>
+<li>根据需求修改zookeeper和kafka jvm参数</li>
+<li>做好kafka监控，特别关注lag指标</li>
+</ul>
+]]></content>
+    </entry>
+</feed>

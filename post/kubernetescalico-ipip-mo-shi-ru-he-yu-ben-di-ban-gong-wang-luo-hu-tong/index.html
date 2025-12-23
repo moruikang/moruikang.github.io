@@ -1,0 +1,270 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kubernetes(calico IPIP模式)如何与本地办公网络互通？ | Gridea</title>
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1766469477645">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Kubernetes(calico IPIP模式)如何与本地办公网络互通？ | Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="需求背景
+在PaaS开发环境中，开发人员经常需要调试部署在PaaS平台上的服务。传统方式可能需要复杂的端口转发或ingress设置，影响开发调试效率。我们的目标是让开发人员能够直接从本地计算机访问Kubernetes集群中的服务，就像访问本..." />
+    <meta name="keywords" content="kubernetes" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1766469477645" alt="">
+  </a>
+  <h1 class="site-title">
+    Gridea
+  </h1>
+  <p class="site-description">
+    日常成长提炼
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Kubernetes(calico IPIP模式)如何与本地办公网络互通？
+            </h2>
+            <div class="post-info">
+              <span>
+                2021-10-21
+              </span>
+              <span>
+                3 min read
+              </span>
+              
+                <a href="https://moruikang.github.io/tag/-JgcjcIE5df/" class="post-tag">
+                  # kubernetes
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h2 id="需求背景">需求背景</h2>
+<p>在PaaS开发环境中，开发人员经常需要调试部署在PaaS平台上的服务。传统方式可能需要复杂的端口转发或ingress设置，影响开发调试效率。我们的目标是让开发人员能够直接从本地计算机访问Kubernetes集群中的服务，就像访问本地服务一样简单。</p>
+<h2 id="网络环境现状">网络环境现状</h2>
+<h3 id="kubernetes集群网络">Kubernetes集群网络：</h3>
+<ul>
+<li>Service CIDR: 172.1.0.0/16</li>
+<li>Pod CIDR: 172.2.0.0/16</li>
+<li>网络插件：Calico（IPIP模式）</li>
+<li>办公室网络：10.168.0.0/16</li>
+</ul>
+<h2 id="解决方案原理">解决方案原理</h2>
+<p>通过路由配置将办公室网络到Kubernetes网络的双向流量打通，使办公室网络中的设备可以直接访问Kubernetes集群中的Service和Pod。</p>
+<h3 id="技术细节">技术细节</h3>
+<h4 id="1-calico-ipip模式深入解析">1、Calico IPIP模式深入解析</h4>
+<p>IPIP隧道工作原理</p>
+<pre><code>+---------------------------------------------------+
+| 原始IP包头 (源: 办公室IP, 目的: Pod IP)           |
++---------------------------------------------------+
+| IPIP头 (协议号: 4)                                |
++---------------------------------------------------+
+| 外部IP头 (源: 节点IP, 目的: 目标节点IP)           |
++---------------------------------------------------+
+</code></pre>
+<h5 id="封装过程">封装过程：</h5>
+<ul>
+<li>办公室网络发往Pod的数据包到达Kubernetes节点</li>
+<li>Calico通过IPIP隧道封装原始数据包</li>
+<li>添加新的IP头，使用节点IP作为源和目的地址</li>
+<li>通过物理网络传输到目标节点</li>
+<li>目标节点解封装，将原始数据包发送到目标Pod</li>
+</ul>
+<h5 id="ipip模式优缺点">IPIP模式优缺点</h5>
+<p>优点：</p>
+<ul>
+<li>跨子网Pod通信</li>
+<li>对底层网络要求较低</li>
+<li>配置相对简单</li>
+</ul>
+<p>缺点：</p>
+<ul>
+<li>额外的封装开销（约20字节）</li>
+<li>性能略低于BGP模式</li>
+</ul>
+<h4 id="2-主机内核参数调整">2、主机内核参数调整</h4>
+<p>在每一台k8s主机上配置内核参数：</p>
+<pre><code># 在所有Kubernetes节点上执行
+echo 'net.ipv4.conf.tunl0.rp_filter = 2' &gt;&gt; /etc/sysctl.conf
+echo 'net.ipv4.ip_forward = 1' &gt;&gt; /etc/sysctl.conf
+sysctl -p
+</code></pre>
+<p>net.ipv4.conf.tunl0.rp_filter = 2<br>
+反向路径过滤（Reverse Path Filtering）：这是一种安全机制，用于验证数据包的来源是否可信<br>
+tunl0接口：这是Calico IPIP模式创建的隧道接口，用于在节点间封装Pod流量<br>
+值说明：<br>
+0：关闭反向路径验证<br>
+1：严格模式，要求进出路径完全一致<br>
+2：宽松模式，只要有一张网卡能到达源地址即允许<br>
+选择2的原因：在IPIP隧道环境中，数据包的进出路径可能不同，宽松模式确保隧道流量正常转发</p>
+<p>net.ipv4.ip_forward = 1<br>
+IPv4包转发：启用所有接口的IPv4数据包转发功能，允许节点作为路由器转发不是发往本机的数据包</p>
+<h4 id="3-办公室路由配置方案">3. 办公室路由配置方案</h4>
+<p>公司路由器配置</p>
+<pre><code># 添加Kubernetes网络路由
+ip route add 172.1.0.0/16 via &lt;K8s-Master-Node-IP&gt;
+ip route add 172.2.0.0/16 via &lt;K8s-Master-Node-IP&gt;
+</code></pre>
+<p>路由选择策略<br>
+选择Master节点作为网关的原因：</p>
+<ul>
+<li>稳定性：Master节点通常不会频繁重启或变更</li>
+<li>可达性：Master节点能够与所有Worker节点通信</li>
+<li>负载考虑：在开发环境中，流量相对较小，Master节点可以承担转发任务</li>
+</ul>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#%E9%9C%80%E6%B1%82%E8%83%8C%E6%99%AF">需求背景</a></li>
+<li><a href="#%E7%BD%91%E7%BB%9C%E7%8E%AF%E5%A2%83%E7%8E%B0%E7%8A%B6">网络环境现状</a>
+<ul>
+<li><a href="#kubernetes%E9%9B%86%E7%BE%A4%E7%BD%91%E7%BB%9C">Kubernetes集群网络：</a></li>
+</ul>
+</li>
+<li><a href="#%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88%E5%8E%9F%E7%90%86">解决方案原理</a>
+<ul>
+<li><a href="#%E6%8A%80%E6%9C%AF%E7%BB%86%E8%8A%82">技术细节</a>
+<ul>
+<li><a href="#1-calico-ipip%E6%A8%A1%E5%BC%8F%E6%B7%B1%E5%85%A5%E8%A7%A3%E6%9E%90">1、Calico IPIP模式深入解析</a>
+<ul>
+<li><a href="#%E5%B0%81%E8%A3%85%E8%BF%87%E7%A8%8B">封装过程：</a></li>
+<li><a href="#ipip%E6%A8%A1%E5%BC%8F%E4%BC%98%E7%BC%BA%E7%82%B9">IPIP模式优缺点</a></li>
+</ul>
+</li>
+<li><a href="#2-%E4%B8%BB%E6%9C%BA%E5%86%85%E6%A0%B8%E5%8F%82%E6%95%B0%E8%B0%83%E6%95%B4">2、主机内核参数调整</a></li>
+<li><a href="#3-%E5%8A%9E%E5%85%AC%E5%AE%A4%E8%B7%AF%E7%94%B1%E9%85%8D%E7%BD%AE%E6%96%B9%E6%A1%88">3. 办公室路由配置方案</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/yun-shang-awskubernetes-zi-dong-kuo-rong-suo-rong-zui-jia-shi-jian/">
+              <h3 class="post-title">
+                云上(AWS)kubernetes自动扩容缩容最佳实践
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

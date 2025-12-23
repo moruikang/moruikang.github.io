@@ -1,0 +1,311 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Rancher如何给用户对k8s资源授权？ | Gridea</title>
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1766469477645">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Rancher如何给用户对k8s资源授权？ | Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="一、什么是Rancher？
+Rancher 是一个 Kubernetes 管理工具，让你能在任何地方和任何提供商上部署和运行集群。
+二、K8s用户体系 &amp; 权限
+k8s本身不存储普通用户的信息，主要是通过service accoun..." />
+    <meta name="keywords" content="" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1766469477645" alt="">
+  </a>
+  <h1 class="site-title">
+    Gridea
+  </h1>
+  <p class="site-description">
+    日常成长提炼
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Rancher如何给用户对k8s资源授权？
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-11-25
+              </span>
+              <span>
+                6 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h2 id="一-什么是rancher">一、什么是Rancher？</h2>
+<p>Rancher 是一个 Kubernetes 管理工具，让你能在任何地方和任何提供商上部署和运行集群。</p>
+<h2 id="二-k8s用户体系-权限">二、K8s用户体系 &amp; 权限</h2>
+<p>k8s本身不存储普通用户的信息，主要是通过service account 来做授权。<br>
+K8s 默认且推荐的授权模式，基于 “角色” 分配权限，灵活性高，支持细粒度控制。其对应的RBAC（Role-Based Access Control）概念如下</p>
+<h4 id="核心概念">核心概念：</h4>
+<ul>
+<li>Role/ClusterRole：定义权限集合（如 “允许查看 Pod”“允许创建 Deployment”）。</li>
+<li>Role：仅作用于单个命名空间。</li>
+<li>ClusterRole：作用于整个集群（或跨命名空间）。</li>
+<li>RoleBinding/ClusterRoleBinding：将 “角色” 绑定到 “用户 / 组 / 服务账户”（即 Subject），使其获得角色定义的权限。<br>
+RoleBinding：仅在单个命名空间内生效。<br>
+ClusterRoleBinding：在整个集群生效。<br>
+<img src="https://moruikang.github.io/post-images/1761400996913.png" alt="" loading="lazy"></li>
+</ul>
+<h2 id="三-rancher用户体系-权限">三、Rancher用户体系 &amp; 权限</h2>
+<h3 id="rancher用户">Rancher用户</h3>
+<p>Rancher 的用户不仅可以来自本地用户数据库，更常见的是集成外部认证系统，如：</p>
+<ul>
+<li>Active Directory / LDAP</li>
+<li>GitHub、Azure AD、Keycloak 等 OAuth2 提供商</li>
+<li>SAML 2.0 提供商<br>
+可以通过users.management.cattle.io这个CRD来查看用户信息。用户登陆后，rancher生成一个字符串的token保存在tokens.management.cattle.io 这个CRD里(简陋且粗暴)</li>
+</ul>
+<h3 id="rancher权限">Rancher权限</h3>
+<p>Rancher 的权限系统分为两层：</p>
+<ul>
+<li>全局权限（Global Permissions）：在 Rancher 层面定义的用户和角色，决定了用户能管理哪些集群、项目等 Rancher 资源。使用globalrolebinding 这个 CRD 来和用户绑定全局角色。</li>
+<li>集群/项目权限（Cluster/Project Permissions）：当用户进入一个具体的集群或项目后，其权限由映射到该集群的 Kubernetes RBAC 规则决定。使用clusterroletemplatebindings 这个 CRD 来和用户绑定集群角色；使用projectroletemplatebindings这个 CRD 来和用户绑定集群角色。<br>
+<img src="https://moruikang.github.io/post-images/1761404773728.png" alt="" loading="lazy"></li>
+</ul>
+<table>
+<thead>
+<tr>
+<th>角色类型</th>
+<th>作用范围</th>
+<th>示例权限</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全局角色</td>
+<td>全局</td>
+<td>创建 / 删除集群、管理全局设置、分配集群权限等</td>
+</tr>
+<tr>
+<td>集群角色</td>
+<td>单个集群</td>
+<td>查看集群节点、创建 Deployment、管理集群网络策略等</td>
+</tr>
+<tr>
+<td>项目角色</td>
+<td>单个项目</td>
+<td>查看项目内 Pod、创建 Service、管理项目内命名空间等</td>
+</tr>
+</tbody>
+</table>
+<p>除此之外，rancher支持通过 Rancher UI 或 API 创建自定义角色，精确指定允许的操作（如 “仅允许查看 Pod 和日志，不允许修改”）。</p>
+<h2 id="四-授权">四、授权</h2>
+<p>这是最精巧的部分。授权分为 Rancher 层面和 Kubernetes 层面。</p>
+<h3 id="41-rancher-层面的授权">4.1 Rancher 层面的授权</h3>
+<p>角色（Roles）：Rancher 预定义了许多全局角色（如 Admin, User, Restricted Admin）和集群/项目角色（如 Cluster Owner, Project Member）。<br>
+绑定（Bindings）：管理员将用户或用户组绑定到某个角色，从而授予他们相应的权限。例如，将用户 Alice 绑定到 Cluster Owner 角色在 dev-cluster 上。<br>
+此时，Rancher 知道用户 Alice 在 dev-cluster 上拥有所有权限。</p>
+<h3 id="42-kubernetes-层面的授权如何落地">4.2 Kubernetes 层面的授权（如何落地）</h3>
+<p>这是关键！Rancher 如何将它的授权决策传递给下游的 Kubernetes 集群呢？它通过以下步骤自动完成：</p>
+<h4 id="421-创建和管理-serviceaccounts">4.2.1 创建和管理 ServiceAccounts</h4>
+<ul>
+<li>当 Rancher 导入或创建一个下游集群时，它会在该集群的 cattle-system 命名空间中创建一个强大的 ServiceAccount，并且使用这个ServiceAccount启动 cattle-cluster-agent 服务（rancher纳管集群的代理服务，从 rancher 发往 k8s 的请求都通过这个 agent 进行，且转发给 agent 的时候，携带了用户在 rancher 上的账号信息，也就是 user CR 的 metadata name）。<pre><code>$ kubectl -n cattle-system get po
+  NAME    READY 
+  cattle-cluster-agent-xxxx
+</code></pre>
+</li>
+<li>这个 ServiceAccount 被绑定了 cluster-admin 类似的超高权限，允许 Rancher 通过 cattle-cluster-agent 服务管理整个集群。</li>
+</ul>
+<h4 id="422-同步用户和角色">4.2.2 同步用户和角色</h4>
+<p>当你在 Rancher 中给用户分配集群或项目权限时，Rancher 会自动在下游集群中创建对应的Kubernetes RBAC 资源。</p>
+<ul>
+<li>为用户创建 ServiceAccount：Rancher 会在每个下游k8s集群的 cattle-impersonation-system 命名空间为每个用户创建一个唯一的 ServiceAccount。这个账户本身没有权限，只是一个标识。<pre><code>$ kubectl -n cattle-impersonation-system get serviceaccount
+  NAME    
+  cattle-impersonation-u-xxxx
+</code></pre>
+</li>
+<li>创建 RoleBindings/ClusterRoleBindings：Rancher 会根据用户在 Rancher 中的角色，在下游集群中创建相应的 ClusterRoleBinding 或 RoleBinding，将用户的 ServiceAccount 绑定到合适的 Kubernetes ClusterRole 或 Role 上。</li>
+<li>例如：Rancher 的 “Project Member” 角色可能对应 Kubernetes 里一个名为 projects-edit 的 ClusterRole。当用户被添加到项目时，Rancher 就在该项目对应的命名空间中创建一个 RoleBinding，将用户的 ServiceAccount 和 projects-edit 角色绑定起来。</li>
+</ul>
+<h3 id="43-扮演-伪装impersonation">4.3 扮演 &amp; 伪装（Impersonation）：</h3>
+<h4 id="什么是用户伪装impersonation">什么是用户伪装(Impersonation)？</h4>
+<p>详见k8s 关于用户伪装的介绍： https://kubernetes.io/zh-cn/docs/reference/access-authn-authz/authentication/<br>
+一个用户可以通过伪装（Impersonation）头部字段来以另一个用户的身份执行操作。 使用这一能力，你可以手动重载请求被身份认证所识别出来的用户信息。<br>
+以下是具体实施：</p>
+<ul>
+<li>当用户 Alice 通过 Rancher 想要列出 dev 命名空间的 Pods 时，这个请求首先发给 Rancher Server。</li>
+<li>Rancher Server 验证 Alice 的权限后，使用它那个高权限的 ServiceAccount 的 token，向下游集群的 API Server 发起请求。</li>
+<li>在这个请求中，Rancher 设置了两个关键的 HTTP Header：
+<ul>
+<li>Impersonate-User: u-abcdefghijk (这是 Alice 在下游集群中对应的唯一用户标识，通常与她的 ServiceAccount 关联)</li>
+<li>Impersonate-Group: system:authenticated (以及其他可能的组)</li>
+</ul>
+</li>
+<li>下游集群的 API Server 接收到请求后：
+<ul>
+<li>首先认证：使用 Rancher 的高权限 ServiceAccount token，认证通过。</li>
+<li>然后授权：它看到 Impersonate 头，会切换到“扮演模式”。它会检查高权限账户是<br>
+impersonate 动词的权限（它有），然后它会假装自己是用户 u-abcdefghijk。</li>
+<li>最后，API Server 会像处理普通用户请求一样，评估被扮演的用户 u-abcdefghijk 是否具有执行该操作（列出 Pods）的 RBAC 权限。这个权限正是之前由 Rancher 自动创建的 RoleBinding 所授予的。</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#%E4%B8%80-%E4%BB%80%E4%B9%88%E6%98%AFrancher">一、什么是Rancher？</a></li>
+<li><a href="#%E4%BA%8C-k8s%E7%94%A8%E6%88%B7%E4%BD%93%E7%B3%BB-%E6%9D%83%E9%99%90">二、K8s用户体系 &amp; 权限</a><br>
+*
+<ul>
+<li><a href="#%E6%A0%B8%E5%BF%83%E6%A6%82%E5%BF%B5">核心概念：</a></li>
+</ul>
+</li>
+<li><a href="#%E4%B8%89-rancher%E7%94%A8%E6%88%B7%E4%BD%93%E7%B3%BB-%E6%9D%83%E9%99%90">三、Rancher用户体系 &amp; 权限</a>
+<ul>
+<li><a href="#rancher%E7%94%A8%E6%88%B7">Rancher用户</a></li>
+<li><a href="#rancher%E6%9D%83%E9%99%90">Rancher权限</a></li>
+</ul>
+</li>
+<li><a href="#%E5%9B%9B-%E6%8E%88%E6%9D%83">四、授权</a>
+<ul>
+<li><a href="#41-rancher-%E5%B1%82%E9%9D%A2%E7%9A%84%E6%8E%88%E6%9D%83">4.1 Rancher 层面的授权</a></li>
+<li><a href="#42-kubernetes-%E5%B1%82%E9%9D%A2%E7%9A%84%E6%8E%88%E6%9D%83%E5%A6%82%E4%BD%95%E8%90%BD%E5%9C%B0">4.2 Kubernetes 层面的授权（如何落地）</a>
+<ul>
+<li><a href="#421-%E5%88%9B%E5%BB%BA%E5%92%8C%E7%AE%A1%E7%90%86-serviceaccounts">4.2.1 创建和管理 ServiceAccounts</a></li>
+<li><a href="#422-%E5%90%8C%E6%AD%A5%E7%94%A8%E6%88%B7%E5%92%8C%E8%A7%92%E8%89%B2">4.2.2 同步用户和角色</a></li>
+</ul>
+</li>
+<li><a href="#43-%E6%89%AE%E6%BC%94-%E4%BC%AA%E8%A3%85impersonation">4.3 扮演 &amp; 伪装（Impersonation）：</a>
+<ul>
+<li><a href="#%E4%BB%80%E4%B9%88%E6%98%AF%E7%94%A8%E6%88%B7%E4%BC%AA%E8%A3%85impersonation">什么是用户伪装(Impersonation)？</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/traefik-cha-jian-xi-lie-zhi-rong-duan/">
+              <h3 class="post-title">
+                Traefik插件系列之--熔断
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

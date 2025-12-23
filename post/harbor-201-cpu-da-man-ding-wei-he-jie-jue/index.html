@@ -1,0 +1,339 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Harbor 2.0.1 CPU 打满定位和解决 | Gridea</title>
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1766469477645">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Harbor 2.0.1 CPU 打满定位和解决 | Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="一、问题背景
+1.1 故障现象
+监控系统告警Harbor Core节点16核心CPU持续打满（CPU 使用率 100%），后续扩容到32核依然快速打满
+PaaS端获取镜像tag出现超时（P99延迟 &gt; 10s）
+二、根因分析
+2.1 ..." />
+    <meta name="keywords" content="" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1766469477645" alt="">
+  </a>
+  <h1 class="site-title">
+    Gridea
+  </h1>
+  <p class="site-description">
+    日常成长提炼
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Harbor 2.0.1 CPU 打满定位和解决
+            </h2>
+            <div class="post-info">
+              <span>
+                2022-10-12
+              </span>
+              <span>
+                5 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h2 id="一-问题背景">一、问题背景</h2>
+<h3 id="11-故障现象">1.1 故障现象</h3>
+<p>监控系统告警Harbor Core节点16核心CPU持续打满（CPU 使用率 100%），后续扩容到32核依然快速打满<br>
+PaaS端获取镜像tag出现超时（P99延迟 &gt; 10s）</p>
+<h2 id="二-根因分析">二、根因分析</h2>
+<h3 id="21-服务器层分析">2.1 服务器层分析</h3>
+<pre><code>top 指令对CPU排序后，发现都是Pg进程导致CPU打满
+</code></pre>
+<h3 id="22数据库层分析">2.2数据库层分析</h3>
+<p>慢查询定位<br>
+通过PostgreSQL内置监控视图pg_stat_activity捕获SQL：</p>
+<pre><code>select
+	datname,
+	usename,
+	client_addr,
+	application_name,
+	state,
+	backend_start,
+	xact_start,
+	xact_stay,
+	query_start,
+	query_stay,
+	replace(query, chr(10), ' ') as query
+from
+	(
+	select
+		pgsa.datname as datname,
+		pgsa.usename as usename,
+		pgsa.client_addr client_addr,
+		pgsa.application_name as application_name,
+		pgsa.state as state,
+		pgsa.backend_start as backend_start,
+		pgsa.xact_start as xact_start,
+		extract(epoch from (now() - pgsa.xact_start)) as xact_stay,
+		pgsa.query_start as query_start,
+		extract(epoch from (now() - pgsa.query_start)) as query_stay ,
+		pgsa.query as query
+	from
+		pg_stat_activity as pgsa
+	where
+		pgsa.state != 'idle'
+		and pgsa.state != 'idle in transaction'
+		and pgsa.state != 'idle in transaction (aborted)') idleconnections
+order by
+	query_stay desc
+limit 5;
+</code></pre>
+<p>看到大量慢SQL，类似如下：</p>
+<pre><code>SELECT COUNT(*) FROM &quot;artifact&quot; T0 
+WHERE T0.&quot;repository_id&quot; = 651 
+AND T0.&quot;id&quot; IN (
+    SELECT DISTINCT art.id FROM artifact art
+    LEFT JOIN tag ON art.id=tag.artifact_id
+    LEFT JOIN artifact_reference ref ON art.id=ref.child_id 
+    WHERE tag.id IS NOT NULL OR ref.id IS NULL
+)
+</code></pre>
+<p>执行计划分析（EXPLAIN ANALYZE）<br>
+关键性能瓶颈点：<br>
+全表扫描：在artifact表上未命中索引<br>
+嵌套循环：多层子查询导致O(n²)复杂度<br>
+无效JOIN：LEFT JOIN后未有效利用索引</p>
+<h3 id="三-寻找解决方案">三、寻找解决方案</h3>
+<h4 id="31-尝试索引优化策略">3.1 尝试索引优化策略</h4>
+<pre><code>-- 关键字段索引补全
+CREATE INDEX CONCURRENTLY idx_artifact_repo_id ON artifact(repository_id);
+CREATE INDEX CONCURRENTLY idx_tag_artifact_id ON tag(artifact_id);
+CREATE INDEX CONCURRENTLY idx_ref_child_id ON artifact_reference(child_id);
+
+-- 复合索引优化
+CREATE INDEX CONCURRENTLY idx_artifact_repo_push_time 
+ON artifact(repository_id, push_time);
+</code></pre>
+<p>创建以上索引后，发现问题依旧</p>
+<h4 id="32-重构慢查询sql">3.2  重构慢查询SQL</h4>
+<p>在github harbor仓库里搜索到同样的issue:<br>
+https://github.com/goharbor/harbor/issues/13890<br>
+官方建议优化SQL语句：https://github.com/goharbor/harbor/pull/14925/commits/dc059a9a8f74f759e8bf155ca5a406a2825712af<br>
+优化前的SQL：</p>
+<pre><code>#代码src/pkg/artifact/dao/dao.go
+const (
+	// both tagged and untagged artifacts
+	both = `IN (
+		SELECT DISTINCT art.id FROM artifact art
+		LEFT JOIN tag ON art.id=tag.artifact_id
+		LEFT JOIN artifact_reference ref ON art.id=ref.child_id
+		WHERE tag.id IS NOT NULL OR ref.id IS NULL)`
+	// only untagged artifacts
+	untagged = `IN (
+		SELECT DISTINCT art.id FROM artifact art
+		LEFT JOIN tag ON art.id=tag.artifact_id
+		WHERE tag.id IS NULL)`
+	// only tagged artifacts
+	tagged = `IN (
+		SELECT DISTINCT art.id FROM artifact art
+		JOIN tag ON art.id=tag.artifact_id
+		WHERE tag.id IS NOT NULL)`
+	// the QuerySetter of beego doesn't support &quot;EXISTS&quot; directly, use qs.FilterRaw(&quot;id&quot;, &quot;=id AND xxx&quot;) to workaround the limitation
+	// base filter: both tagged and untagged artifacts
+    ```
+    
+优化后的SQL：
+    ```
+
+	both = `=id AND (
+		EXISTS (SELECT 1 FROM tag WHERE tag.artifact_id = T0.id)
+		OR 
+		NOT EXISTS (SELECT 1 FROM artifact_reference ref WHERE ref.child_id = T0.id)
+	)`
+	// tag filter: only untagged artifacts
+	// the &quot;untagged&quot; filter is based on &quot;base&quot; filter, so we consider the tag only
+	untagged = `=id AND NOT EXISTS(
+		SELECT 1 FROM tag WHERE tag.artifact_id = T0.id
+	)`
+	// tag filter: only tagged artifacts
+	tagged = `=id AND EXISTS (
+		SELECT 1 FROM tag WHERE tag.artifact_id = T0.id
+	)`
+)
+</code></pre>
+<p>优化原理<br>
+消除冗余的DISTINCT操作<br>
+将IN子查询改写为EXISTS半连接<br>
+利用布尔短路特性提前终止条件判断</p>
+<p>因为该版本的Harbor和公司PaaS深度继承，无法升级到官方已经优化后的SQL版本(Harbor 2.2之后)，所以只能对Harbor源码导致慢查询的SQL代码修改后，重新构建镜像</p>
+<h2 id="四-修改源码后重新构建harbor-core镜像">四、修改源码后，重新构建Harbor core镜像</h2>
+<pre><code>git clone https://github.com/goharbor/harbor.git
+cd harbor
+git checkout v2.0.1
+
+</code></pre>
+<p>可以在Makefile里面看到所有的镜像构建指令，写的比较复杂，只需要关注core镜像部分即可，以下是我整理后的构建指令</p>
+<pre><code>#删除旧二进制文件
+rm make/photon/core/harbor_core
+
+#编译二进制文件
+make compile_core
+
+#修改version文件，需要跟原来镜像保持一致
+#vim make/photon/prepare/versions
+
+#手动构建core镜像
+docker build --build-arg harbor_base_image_version=dev --build-arg harbor_base_namespace=goharbor -f /root/harbor-2.0.1/make/photon/core/Dockerfile -t goharbor/harbor-core:v2.0.1-hotfix20220916 .
+</code></pre>
+<p>随后，替换线上环境Harbor core镜像即可</p>
+<p>上线后，CPU立马下降</p>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#%E4%B8%80-%E9%97%AE%E9%A2%98%E8%83%8C%E6%99%AF">一、问题背景</a>
+<ul>
+<li><a href="#11-%E6%95%85%E9%9A%9C%E7%8E%B0%E8%B1%A1">1.1 故障现象</a></li>
+</ul>
+</li>
+<li><a href="#%E4%BA%8C-%E6%A0%B9%E5%9B%A0%E5%88%86%E6%9E%90">二、根因分析</a>
+<ul>
+<li><a href="#21-%E6%9C%8D%E5%8A%A1%E5%99%A8%E5%B1%82%E5%88%86%E6%9E%90">2.1 服务器层分析</a></li>
+<li><a href="#22%E6%95%B0%E6%8D%AE%E5%BA%93%E5%B1%82%E5%88%86%E6%9E%90">2.2数据库层分析</a></li>
+<li><a href="#%E4%B8%89-%E5%AF%BB%E6%89%BE%E8%A7%A3%E5%86%B3%E6%96%B9%E6%A1%88">三、寻找解决方案</a>
+<ul>
+<li><a href="#31-%E5%B0%9D%E8%AF%95%E7%B4%A2%E5%BC%95%E4%BC%98%E5%8C%96%E7%AD%96%E7%95%A5">3.1 尝试索引优化策略</a></li>
+<li><a href="#32-%E9%87%8D%E6%9E%84%E6%85%A2%E6%9F%A5%E8%AF%A2sql">3.2  重构慢查询SQL</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a href="#%E5%9B%9B-%E4%BF%AE%E6%94%B9%E6%BA%90%E7%A0%81%E5%90%8E%E9%87%8D%E6%96%B0%E6%9E%84%E5%BB%BAharbor-core%E9%95%9C%E5%83%8F">四、修改源码后，重新构建Harbor core镜像</a></li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/kubernetescalico-ipip-mo-shi-ru-he-yu-ben-di-ban-gong-wang-luo-hu-tong/">
+              <h3 class="post-title">
+                Kubernetes(calico IPIP模式)如何与本地办公网络互通？
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

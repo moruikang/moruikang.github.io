@@ -1,0 +1,423 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>使用Kops和Terraform在AWS部署Kubernetes高可用集群 | Gridea</title>
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1766469477645">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="使用Kops和Terraform在AWS部署Kubernetes高可用集群 | Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="一.介绍
+Kops是一个命令行工具，可用于在AWS上部署符合生产要求的Kubernetes集群。它具有创建跨越多个可用性区域的高可用性群集的能力，并支持专用网络拓扑。默认情况下，Kops将在AWS建立kubernetes所有需要的资源EC2..." />
+    <meta name="keywords" content="kop,kubernetes" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1766469477645" alt="">
+  </a>
+  <h1 class="site-title">
+    Gridea
+  </h1>
+  <p class="site-description">
+    日常成长提炼
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              使用Kops和Terraform在AWS部署Kubernetes高可用集群
+            </h2>
+            <div class="post-info">
+              <span>
+                2020-01-03
+              </span>
+              <span>
+                9 min read
+              </span>
+              
+                <a href="https://moruikang.github.io/tag/wSLtpHywlh/" class="post-tag">
+                  # kop
+                </a>
+              
+                <a href="https://moruikang.github.io/tag/-JgcjcIE5df/" class="post-tag">
+                  # kubernetes
+                </a>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h2 id="一介绍">一.介绍</h2>
+<p>Kops是一个命令行工具，可用于在AWS上部署符合生产要求的Kubernetes集群。它具有创建跨越多个可用性区域的高可用性群集的能力，并支持专用网络拓扑。默认情况下，Kops将在AWS建立kubernetes所有需要的资源EC2，VPC和子网，并在Route53添加DNS解析记录，使用AWS负载平衡器(ELB)暴露Kubernetes API，和其他需要的基础设施组件。<br>
+Terraform是用来管理云上基础架构的工具，它的理念是基础设施即代码，使用代码来配置和管理任何云资源</p>
+<h2 id="二架构">二.架构</h2>
+<figure data-type="image" tabindex="1"><img src="https://moruikang.github.io/post-images/1739886645055.jpg" alt="" loading="lazy"></figure>
+<h2 id="三创建集群">三.创建集群</h2>
+<h4 id="提前准备">提前准备</h4>
+<ul>
+<li>AWS Administrator account</li>
+<li>GoDaddy账号</li>
+</ul>
+<h3 id="1-创建aws-iamroute53">1. 创建AWS IAM，Route53</h3>
+<p>详见Kops文档</p>
+<h4 id="11-创建iam用户">1.1 创建IAM用户</h4>
+<p>为了在AWS内构建集群，需要创建一个专用的IAM用户kops。这个用户需要API凭据才能使用kops。使用AWS控制台创建用户并下载ACCESS KEY和SECRET凭证(请自行在AWS IAM控制台执行创建操作)。<br>
+这个kops用户需要以下IAM权限：</p>
+<ul>
+<li>AmazonEC2FullAccess</li>
+<li>AmazonRoute53FullAccess</li>
+<li>AmazonS3FullAccess</li>
+<li>IAMFullAccess</li>
+<li>AmazonVPCFullAccess<br>
+创建kops用户并下载ACCESS KEY和SECRET凭证后<br>
+执行</li>
+</ul>
+<pre><code># 使用上一步保存的ACCESS KEY和SECRET，配置aws cli 
+$ aws configure
+$ export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+$ export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+</code></pre>
+<h4 id="12-配置route-53">1.2 配置Route 53</h4>
+<p>为什么需要操作这一步？<br>
+因为kops创建k8s集群需要一个域名，这个域名的ns(namespace)托管在Route53后，Kops可以在AWS可以创建一些子域名分别指向不同应用服务</p>
+<pre><code>api.internal.xxx.com =&gt; k8s master
+etcd-x.internal.xxx.com =&gt; etcd 
+api.xxx.com =&gt; k8s api-server
+bastion.xxx.com =&gt; k8s bastion
+...
+</code></pre>
+<p>创建AWS Route53托管区域</p>
+<pre><code># subdomain.example.com是你在godaddy(或者别的域名商)的域名
+$ ID=$(uuidgen) &amp;&amp; aws route53 create-hosted-zone --name subdomain.example.com --caller-reference $ID | \
+    jq .DelegationSet.NameServers
+</code></pre>
+<p>生成:<br>
+<img src="https://moruikang.github.io/post-images/1739886679173.jpg" alt="" loading="lazy"></p>
+<p>记录下来 AWS Route53托管区域ID 下一步会需要到</p>
+<pre><code>$ aws route53 list-hosted-zones | jq '.HostedZones[] | select(.Name==&quot;example.com.&quot;) | .Id'
+# 输出结果类似以下内容:
+{
+  &quot;Comment&quot;: &quot;Create a subdomain NS record in the parent domain&quot;,
+  &quot;Changes&quot;: [
+    {
+      &quot;Action&quot;: &quot;CREATE&quot;,
+      &quot;ResourceRecordSet&quot;: {
+        &quot;Name&quot;: &quot;subdomain.example.com&quot;,
+        &quot;Type&quot;: &quot;NS&quot;,
+        &quot;TTL&quot;: 300,
+        &quot;ResourceRecords&quot;: [
+          {
+            &quot;Value&quot;: &quot;ns-1.awsdns-1.co.uk&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-2.awsdns-2.org&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-3.awsdns-3.com&quot;
+          },
+          {
+            &quot;Value&quot;: &quot;ns-4.awsdns-4.net&quot;
+          }
+        ]
+      }
+    }
+  ]
+}
+</code></pre>
+<p>最后在godaddy那边对该域名添加以上4条ns记录(value字段的4条内容)<br>
+本地验证ns是否生效</p>
+<pre><code>$ dig NS subdomain.example.com +short
+#输出结果应该为以上添加的4条ns记录
+</code></pre>
+<h3 id="2-创建vpc网络和kubernetes集群">2. 创建VPC网络和kubernetes集群</h3>
+<pre><code>$ git clone https://github.com/ryane/kubernetes-aws-vpc-kops-terraform.git
+$ cd kubernetes-aws-vpc-kops-terraform
+$ export AWS_ACCESS_KEY_ID=$(aws configure get aws_access_key_id)
+$ export AWS_SECRET_ACCESS_KEY=$(aws configure get aws_secret_access_key)
+
+#创建terraform集群配置
+$ cat &lt;&lt;EOF  &gt; subdomain.example.com.tfvars
+name=&quot;example.com&quot;
+region=&quot;ap-southeast-1&quot; 
+azs=[&quot;ap-southeast-1a&quot;,&quot;ap-southeast-1b&quot;,&quot;ap-southeast-1c&quot;]
+env=&quot;prod&quot;
+vpc_cidr=&quot;10.3.0.0/16&quot;
+EOF
+$ ls
+README.md   main.tf   outputs.tf    subdomain.example.com.tfvars variables.tf   gensubnets  modules override.tf update-zone.json
+</code></pre>
+<p>可以看到，这里都是项目的terraform代码。<br>
+一切准备妥当，可以开始创建vpc了</p>
+<pre><code>$ terraform init  # 初始化代码，下载依赖包国内网络会有点久，翻墙好点
+$ terraform plan -var-file=subdomain.example.com.tfvars  #建议所有操作有预执行一遍
+$ terraform apply -var-file=subdomain.example.com.tfvars -auto-approve
+</code></pre>
+<p>完成创建VPC， 去到AWS VPC控制台，会看到创建的VPC,6个子网，4个路由表，3个私网的NAT网关等等<br>
+下一步开始我们的主题，创建kubernetes集群</p>
+<pre><code>$ export NAME=$(terraform output cluster_name)
+$ export KOPS_STATE_STORE=$(terraform output state_store)
+$ export ZONES=$(terraform output -json availability_zones | jq -r '.value|join(&quot;,&quot;)')
+$ export MASTER_SIZE=${MASTER_SIZE:-m5.large}
+$ export NODE_SIZE=${NODE_SIZE:-m5.xlarge}
+
+$ kops create cluster \
+    --associate-public-ip=false \
+    --bastion \
+    --master-count 3 \
+    --master-size $MASTER_SIZE \
+    --master-zones $ZONES \
+    --zones $ZONES \
+    --topology private \
+    --dns-zone Z25xxxxxxxx4U6 \  #这里输入前面route53生成的托管区域id
+    --networking amazon-vpc-routed-eni \  # 选择aws提供的k8s cni
+    --network-cidr 10.3.0.0/16 \
+    --node-count 1 \
+    --node-size $NODE_SIZE \
+    --vpc $(terraform output vpc_id) \
+    --ssh-access 0.0.0.0/0 \  #建议输入你的本地公网ip地址
+    --target=terraform \
+    --out=. \
+    ${NAME}
+</code></pre>
+<pre><code># 导出子网设置,记录下来，后续需要修改cluster子网设置
+$ terraform output -json | docker run --rm -i ryane/gensubnets:0.1
+# 把以上输出子网信息复制下来
+$ kops get cluster ${NAME} -o yaml &gt; cluster.yaml  #备份集群yaml
+$ kops edit cluster ${NAME}
+# 修改前的子网部分应该类似如下：
+subnets:
+- cidr: 10.20.32.0/19
+  name: us-east-1a
+  type: Private
+  zone: us-east-1a
+- cidr: 10.20.64.0/19
+  name: us-east-1c
+  type: Private
+  zone: us-east-1c
+- cidr: 10.20.96.0/19
+  name: us-east-1d
+  type: Private
+  zone: us-east-1d
+- cidr: 10.20.0.0/22
+  name: utility-us-east-1a
+  type: Utility
+  zone: us-east-1a
+- cidr: 10.20.4.0/22
+  name: utility-us-east-1c
+  type: Utility
+  zone: us-east-1c
+- cidr: 10.20.8.0/22
+  name: utility-us-east-1d
+  type: Utility
+  zone: us-east-1d
+#使用前一步的子网输出信息，替换*subnets* 模块里的子网内容，替换后应该类似如下：
+subnets:
+- egress: nat-0b2f7f77b15041515
+  id: subnet-8db395d6
+  name: us-east-1a
+  type: Private
+  zone: us-east-1a
+- egress: nat-059d239e3f86f6da9
+  id: subnet-fd6b41d0
+  name: us-east-1c
+  type: Private
+  zone: us-east-1c
+- egress: nat-0231eef9a93386f4a
+  id: subnet-5fc6dd16
+  name: us-east-1d
+  type: Private
+  zone: us-east-1d
+- id: subnet-0ab39551
+  name: utility-us-east-1a
+  type: Utility
+  zone: us-east-1a
+- id: subnet-656b4148
+  name: utility-us-east-1c
+  type: Utility
+  zone: us-east-1c
+- id: subnet-cdc7dc84
+  name: utility-us-east-1d
+  type: Utility
+  zone: us-east-1d
+# 更新修改
+$ kops update cluster \
+  --out=. \
+  --target=terraform \
+  ${NAME}
+$ terraform plan -var-file=subdomain.example.com.tfvars
+$ terraform apply -var-file=subdomain.example.com.tfvars -auto-approve
+</code></pre>
+<p>这样子，整个k8s集群都部署完成。<br>
+kubeconfig自动生成在你本地~/.kube/config， bastion节点的登陆私钥默认是~/.ssh/id_rsa(kops创建集群的时候可以使用--ssh-public-key参数指定公钥)</p>
+<pre><code>$ kops get instancegroups
+NAME                    ROLE    MACHINETYPE     MIN     MAX     ZONES
+bastions                Bastion t2.micro        1       1       ap-southeast-1a
+master-ap-southeast-1a  Master  m5.xlarge       1       1       ap-southeast-1a
+master-ap-southeast-1b  Master  m5.xlarge       1       1       ap-southeast-1b
+master-ap-southeast-1c  Master  m5.xlarge       1       1       ap-southeast-1c
+nodes                   Node    m5.xlarge       3       20      ap-southeast-1a,ap-southeast-1b,ap-southeast-1c
+</code></pre>
+<p>切换到aws Route53控制台，可以发现有2条对外的域名，分别是:<br>
+api.subdomain.example.com(dns指向bastion节点的Load Balancer，查看kubeconfig内容，该域名即为apiserver)<br>
+bastion.subdomain.example.com(dns指向k8s master节点的Load Balancer）<br>
+修改这两个域名的访问ip控制，可从对应的Load Balancer安全组修改。</p>
+<p>切换到AWS S3控制台信息，可以看到多了一个S3 bucket， 这个S3 Bucket是用来存储kops k8s集群信息的。<br>
+切换到AWS EC2控制台，发现auto scaling多了5个组，分别对应kops get instancegroups的内容。<br>
+切换到AWS IAM，发现kops为每一个instancegroup都创建了对应的role角色权限。<br>
+清除所有基础资源</p>
+<pre><code>$ terraform destroy
+</code></pre>
+<h4 id="建议">建议:</h4>
+<ul>
+<li>以后所有的基础资源改动，都经过terraform，不需要手动在AWS控制台修改，否则下次terraform执行引起冲突</li>
+<li>对于k8s集群，如果需要扩大集群节点的CIDR块，在创建集群前，可修改代码里的(位置：modules/subnet-pair/variables.tf）newbits，默认是8，改小可以扩大CIDR块。</li>
+</ul>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#%E4%B8%80%E4%BB%8B%E7%BB%8D">一.介绍</a></li>
+<li><a href="#%E4%BA%8C%E6%9E%B6%E6%9E%84">二.架构</a></li>
+<li><a href="#%E4%B8%89%E5%88%9B%E5%BB%BA%E9%9B%86%E7%BE%A4">三.创建集群</a><br>
+*
+<ul>
+<li><a href="#%E6%8F%90%E5%89%8D%E5%87%86%E5%A4%87">提前准备</a></li>
+<li><a href="#1-%E5%88%9B%E5%BB%BAaws-iamroute53">1. 创建AWS IAM，Route53</a>
+<ul>
+<li><a href="#11-%E5%88%9B%E5%BB%BAiam%E7%94%A8%E6%88%B7">1.1 创建IAM用户</a></li>
+<li><a href="#12-%E9%85%8D%E7%BD%AEroute-53">1.2 配置Route 53</a></li>
+</ul>
+</li>
+<li><a href="#2-%E5%88%9B%E5%BB%BAvpc%E7%BD%91%E7%BB%9C%E5%92%8Ckubernetes%E9%9B%86%E7%BE%A4">2. 创建VPC网络和kubernetes集群</a>
+<ul>
+<li><a href="#%E5%BB%BA%E8%AE%AE">建议:</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/prometheus-quan-mian-jian-kong-kafka-ji-qun/">
+              <h3 class="post-title">
+                Prometheus全面监控kafka集群
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

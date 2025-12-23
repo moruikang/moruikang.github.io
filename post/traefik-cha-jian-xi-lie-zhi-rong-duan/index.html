@@ -1,0 +1,589 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Traefik插件系列之--熔断 | Gridea</title>
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1766469477645">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="Traefik插件系列之--熔断 | Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="一、什么是熔断？
+熔断（Circuit Breaker）是分布式系统中用于防止故障扩散、保护服务稳定性的一种容错机制，核心思想类似于现实中的电路保险丝：当某个服务或依赖组件出现持续故障时，“熔断” 机制会主动切断对它的调用，避免故障级联传播..." />
+    <meta name="keywords" content="" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1766469477645" alt="">
+  </a>
+  <h1 class="site-title">
+    Gridea
+  </h1>
+  <p class="site-description">
+    日常成长提炼
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              Traefik插件系列之--熔断
+            </h2>
+            <div class="post-info">
+              <span>
+                2023-10-28
+              </span>
+              <span>
+                13 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h2 id="一-什么是熔断">一、什么是熔断？</h2>
+<p>熔断（Circuit Breaker）是分布式系统中用于防止故障扩散、保护服务稳定性的一种容错机制，核心思想类似于现实中的电路保险丝：当某个服务或依赖组件出现持续故障时，“熔断” 机制会主动切断对它的调用，避免故障级联传播导致整个系统崩溃，同时为故障组件提供恢复时间。<br>
+作用：</p>
+<ul>
+<li>防止 “雪崩效应”</li>
+<li>在分布式系统中，若一个服务（如 A）依赖另一个服务（如 B），当 B 故障时，A 的大量请求会阻塞等待 B 的响应，导致 A 的资源（线程、连接池等）耗尽，进而影响依赖 A 的其他服务，最终引发整个系统瘫痪。熔断机制通过 “快速失败” 避免这种级联故障。<br>
+提高系统响应速度：当依赖服务故障时，熔断机制会直接返回预设的 “降级响应”（如缓存数据、默认值），而非等待超时，减少用户等待时间。</li>
+<li>自动恢复：在故障组件恢复后，熔断机制能逐步恢复正常调用，避免突然的流量冲击再次压垮服务。</li>
+</ul>
+<h2 id="二-traefik-熔断插件介绍">二、 traefik 熔断插件介绍</h2>
+<p>在 Kubernetes 中，Traefik 的熔断插件通过 CircuitBreaker 中间件实现</p>
+<h3 id="21-核心配置参数源码和-yaml如下">2.1 核心配置参数源码和 YAML如下</h3>
+<p>pkg/config/dynamic/middlewares.go</p>
+<pre><code>type CircuitBreaker struct {
+	// Expression defines the expression that, once matched, opens the circuit breaker and applies the fallback mechanism instead of calling the services.
+	Expression string `json:&quot;expression,omitempty&quot; toml:&quot;expression,omitempty&quot; yaml:&quot;expression,omitempty&quot; export:&quot;true&quot;`
+	// CheckPeriod is the interval between successive checks of the circuit breaker condition (when in standby state).
+	CheckPeriod ptypes.Duration `json:&quot;checkPeriod,omitempty&quot; toml:&quot;checkPeriod,omitempty&quot; yaml:&quot;checkPeriod,omitempty&quot; export:&quot;true&quot;`
+	// FallbackDuration is the duration for which the circuit breaker will wait before trying to recover (from a tripped state).
+	FallbackDuration ptypes.Duration `json:&quot;fallbackDuration,omitempty&quot; toml:&quot;fallbackDuration,omitempty&quot; yaml:&quot;fallbackDuration,omitempty&quot; export:&quot;true&quot;`
+	// RecoveryDuration is the duration for which the circuit breaker will try to recover (as soon as it is in recovering state).
+	RecoveryDuration ptypes.Duration `json:&quot;recoveryDuration,omitempty&quot; toml:&quot;recoveryDuration,omitempty&quot; yaml:&quot;recoveryDuration,omitempty&quot; export:&quot;true&quot;`
+	// ResponseCode is the status code that the circuit breaker will return while it is in the open state.
+	ResponseCode int `json:&quot;responseCode,omitempty&quot; toml:&quot;responseCode,omitempty&quot; yaml:&quot;responseCode,omitempty&quot; export:&quot;true&quot;`
+}
+</code></pre>
+<table>
+<thead>
+<tr>
+<th style="text-align:center">参数名称</th>
+<th style="text-align:center">类型</th>
+<th style="text-align:center">说明</th>
+<th style="text-align:center">示例值 / 默认值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:center">expression</td>
+<td style="text-align:center">String</td>
+<td style="text-align:center">熔断触发条件表达式，支持多种指标组合（如错误率、延迟）。</td>
+<td style="text-align:center">&quot;NetworkErrorRatio() &gt; 0.3&quot;</td>
+</tr>
+<tr>
+<td style="text-align:center">fallbackDuration</td>
+<td style="text-align:center">Duration</td>
+<td style="text-align:center">熔断状态（Tripped）的持续时间，期间所有请求触发降级。</td>
+<td style="text-align:center">10s（默认）</td>
+</tr>
+<tr>
+<td style="text-align:center">recoveryDuration</td>
+<td style="text-align:center">Duration</td>
+<td style="text-align:center">恢复阶段（Recovering）的持续时间，期间逐步恢复流量。</td>
+<td style="text-align:center">10s（默认）</td>
+</tr>
+<tr>
+<td style="text-align:center">checkPeriod</td>
+<td style="text-align:center">Duration</td>
+<td style="text-align:center">熔断条件的检查间隔（仅在 Standby 状态生效）。</td>
+<td style="text-align:center">100ms（默认）</td>
+</tr>
+<tr>
+<td style="text-align:center">responseCode</td>
+<td style="text-align:center">Integer</td>
+<td style="text-align:center">熔断时返回的 HTTP 状态码（默认 503）。</td>
+<td style="text-align:center">503 或 200（自定义）</td>
+</tr>
+</tbody>
+</table>
+<h3 id="22-expression表达式有以下三种类型">2.2 expression表达式有以下三种类型：</h3>
+<ul>
+<li><strong>网络错误率 <code>NetworkErrorRatio</code> : NetworkErrorRatio() &gt; 0.30 ，网络错误率大于30%触发</strong></li>
+<li><strong>状态码比例 <code>ResponseCodeRatio</code> : ResponseCodeRatio(500, 600, 0, 600) &gt; 0.3，5xx的状态码大于总请求(在2xx-5xx状态码内)的30%触发</strong></li>
+<li><strong>延迟阈值 <code>LatencyAtQuantileMS</code> : LatencyAtQuantileMS(50.0) &gt; 100 ，50%请求延迟&gt; 100ms</strong></li>
+<li>组合条件：支持 ||（或）和 &amp;&amp;（且）运算符，例如：<pre><code>expression: &quot;LatencyAtQuantileMS(50.0) &gt; 200 &amp;&amp; NetworkErrorRatio() &gt; 0.2&quot;
+</code></pre>
+</li>
+</ul>
+<h3 id="23-yaml示例">2.3 YAML示例：</h3>
+<h4 id="231-基础熔断配置基于网络错误率">2.3.1. 基础熔断配置（基于网络错误率）</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: basic-circuit-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;NetworkErrorRatio() &gt; 0.3&quot;  # 网络错误率超过30%时熔断
+    fallbackDuration: 10s                    # 熔断持续10秒
+    recoveryDuration: 15s                    # 恢复阶段持续15秒
+</code></pre>
+<h4 id="232-基于响应状态码和延迟的组合条件">2.3.2. 基于响应状态码和延迟的组合条件</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: combined-condition-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;LatencyAtQuantileMS(50.0) &gt; 200 || ResponseCodeRatio(500, 600, 0, 600) &gt; 0.2&quot;
+    # 50%请求延迟超过200ms 或 5xx状态码占比超过20%时熔断
+    fallbackDuration: 20s
+    responseCode: 500                        # 熔断时返回500状态码
+</code></pre>
+<h4 id="233-自定义恢复阶段的流量比例">2.3.3. 自定义恢复阶段的流量比例</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: custom-recovery-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;NetworkErrorRatio() &gt; 0.5&quot;
+    fallbackDuration: 10s
+    recoveryDuration: 30s                    # 恢复阶段延长至30秒
+    # 恢复阶段的流量比例公式：0.5 * (当前时间 - 恢复开始时间) / recoveryDuration
+    # 30秒后允许50%的请求通过
+</code></pre>
+<h4 id="234-基于路径的熔断配置">2.3.4. 基于路径的熔断配置</h4>
+<pre><code>apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: path-based-breaker
+spec:
+  circuitBreaker:
+    expression: &quot;NetworkErrorRatio() &gt; 0.4&quot;
+    fallbackDuration: 10s
+    # 仅对路径 /api/v1/orders 生效（通过 IngressRoute 绑定）
+</code></pre>
+<h2 id="三-熔断状态机">三 熔断状态机</h2>
+<h3 id="31-熔断器有三个状态">3.1 熔断器有三个状态:</h3>
+<ul>
+<li>Closed(关闭): 正常运行,收集指标并定期检查表达式</li>
+<li>Open(打开): 触发降级机制,持续 FallbackDuration 时间后进入恢复状态</li>
+<li>Recovering(恢复): 线性递增流量,持续 RecoveryDuration 时间</li>
+</ul>
+<h3 id="32-熔断器的恢复行为由以下参数控制">3.2 熔断器的恢复行为由以下参数控制</h3>
+<ul>
+<li>RecoveryDuration: 恢复阶段的持续时间,默认 10 秒</li>
+<li>FallbackDuration: 打开状态的持续时间,默认 10 秒</li>
+<li>CheckPeriod: 检查周期,默认 100 毫秒</li>
+</ul>
+<p>Traefik 的熔断器实现依赖于 vulcand/oxy 库的 cbreaker.CircuitBreaker。 在创建熔断器时,这些配置参数会被传递给底层实现<br>
+恢复期间的具体流量控制逻辑由 oxy 库实现,Traefik 通过配置 RecoveryDuration 参数来控制恢复时长。在恢复期间,如果服务再次失败,熔断器会重新打开;如果整个恢复期间服务正常运行,熔断器会关闭。<br>
+核心代码如下：<br>
+vulcand/oxy/v2/cbreaker.go</p>
+<pre><code>// CircuitBreaker is http.Handler that implements circuit breaker pattern.
+type CircuitBreaker struct {
+	m       *sync.RWMutex
+	metrics *memmetrics.RTMetrics
+
+	condition hpredicate
+
+	fallbackDuration time.Duration
+	recoveryDuration time.Duration
+
+	onTripped SideEffect
+	onStandby SideEffect
+
+	state cbState
+	until clock.Time
+
+	rc *ratioController
+
+	checkPeriod time.Duration
+	lastCheck   clock.Time
+
+	fallback http.Handler
+	next     http.Handler
+
+	verbose bool
+	log     utils.Logger
+}
+
+// updateState updates internal state and returns true if fallback should be used and false otherwise.
+func (c *CircuitBreaker) activateFallback(_ http.ResponseWriter, _ *http.Request) bool {
+	// Quick check with read locks optimized for normal operation use-case
+	if c.isStandby() {
+		return false
+	}
+	// Circuit breaker is in tripped or recovering state
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	c.log.Warn(&quot;%v is in error state&quot;, c)
+
+	switch c.state {
+	case stateStandby:
+		// someone else has set it to standby just now
+		return false
+	case stateTripped:
+		if clock.Now().UTC().Before(c.until) {
+			return true
+		}
+		// We have been in active state enough, enter recovering state
+		c.setRecovering()
+		fallthrough
+	case stateRecovering:
+		// We have been in recovering state enough, enter standby and allow request
+		if clock.Now().UTC().After(c.until) {
+			c.setState(stateStandby, clock.Now().UTC())
+			return false
+		}
+		// ratio controller allows this request
+		if c.rc.allowRequest() {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (c *CircuitBreaker) isStandby() bool {
+	c.m.RLock()
+	defer c.m.RUnlock()
+	return c.state == stateStandby
+}
+
+// String returns log-friendly representation of the circuit breaker state.
+func (c *CircuitBreaker) String() string {
+	switch c.state {
+	case stateTripped, stateRecovering:
+		return fmt.Sprintf(&quot;CircuitBreaker(state=%v, until=%v)&quot;, c.state, c.until)
+	default:
+		return fmt.Sprintf(&quot;CircuitBreaker(state=%v)&quot;, c.state)
+	}
+}
+
+// exec executes side effect.
+func (c *CircuitBreaker) exec(s SideEffect) {
+	if s == nil {
+		return
+	}
+	go func() {
+		if err := s.Exec(); err != nil {
+			c.log.Error(&quot;%v side effect failure: %v&quot;, c, err)
+		}
+	}()
+}
+
+func (c *CircuitBreaker) setState(state cbState, until time.Time) {
+	c.log.Debug(&quot;%v setting state to %v, until %v&quot;, c, state, until)
+	c.state = state
+	c.until = until
+	switch state {
+	case stateTripped:
+		c.exec(c.onTripped)
+	case stateStandby:
+		c.exec(c.onStandby)
+	}
+}
+
+func (c *CircuitBreaker) timeToCheck() bool {
+	c.m.RLock()
+	defer c.m.RUnlock()
+	return clock.Now().UTC().After(c.lastCheck)
+}
+
+// Checks if tripping condition matches and sets circuit breaker to the tripped state.
+func (c *CircuitBreaker) checkAndSet() {
+	if !c.timeToCheck() {
+		return
+	}
+
+	c.m.Lock()
+	defer c.m.Unlock()
+
+	// Other goroutine could have updated the lastCheck variable before we grabbed mutex
+	if clock.Now().UTC().Before(c.lastCheck) {
+		return
+	}
+	c.lastCheck = clock.Now().UTC().Add(c.checkPeriod)
+
+	if c.state == stateTripped {
+		c.log.Debug(&quot;%v skip set tripped&quot;, c)
+		return
+	}
+
+	if !c.condition(c) {
+		return
+	}
+
+	c.setState(stateTripped, clock.Now().UTC().Add(c.fallbackDuration))
+	c.metrics.Reset()
+}
+
+func (c *CircuitBreaker) setRecovering() {
+	c.setState(stateRecovering, clock.Now().UTC().Add(c.recoveryDuration))
+	c.rc = newRatioController(c.recoveryDuration, c.log)
+}
+
+// cbState is the state of the circuit breaker.
+type cbState int
+
+func (s cbState) String() string {
+	switch s {
+	case stateStandby:
+		return &quot;standby&quot;
+	case stateTripped:
+		return &quot;tripped&quot;
+	case stateRecovering:
+		return &quot;recovering&quot;
+	}
+	return &quot;undefined&quot;
+}
+
+const (
+	// CircuitBreaker is passing all requests and watching stats.
+	stateStandby = iota
+	// CircuitBreaker activates fallback scenario for all requests.
+	stateTripped
+	// CircuitBreaker passes some requests to go through, rejecting others.
+	stateRecovering
+)
+
+const (
+	defaultFallbackDuration = 10 * clock.Second
+	defaultRecoveryDuration = 10 * clock.Second
+	defaultCheckPeriod      = 100 * clock.Millisecond
+)
+</code></pre>
+<h3 id="33-从熔断tripped到恢复recovering的触发">3.3 从熔断（Tripped）到恢复（Recovering）的触发</h3>
+<p>当系统进入Tripped状态后，所有请求会被降级处理，持续时间由fallbackDuration（默认 10 秒）控制。当该时长结束后，自动进入Recovering状态，开始恢复流程：</p>
+<h4 id="331-tripped-状态的持续检查">3.3.1 Tripped 状态的持续检查：</h4>
+<p>在activateFallback函数中，每次请求到来时会检查Tripped状态的截止时间（until字段，初始化为进入Tripped时的时间 + fallbackDuration）。</p>
+<pre><code>case stateTripped:
+    if clock.Now().UTC().Before(c.until) {
+        return true // 仍在熔断期，继续降级
+    }
+    // 熔断期结束，进入恢复状态
+    c.setRecovering()
+</code></pre>
+<h4 id="332-进入-recovering-状态的初始化">3.3.2 进入 Recovering 状态的初始化：</h4>
+<p>调用setRecovering()函数，完成以下操作：</p>
+<ul>
+<li>状态切换为stateRecovering，并设置恢复阶段的截止时间（until = 当前时间 + recoveryDuration，默认 10 秒）。</li>
+<li>初始化ratioController（比例控制器），用于控制恢复阶段允许通过的请求比例。</li>
+<li>触发状态转换副作用（如配置了OnTripped回调，会在进入 Tripped 时执行，但此处是从 Tripped 到 Recovering 的过渡）。</li>
+</ul>
+<h3 id="34-recovering恢复状态的核心逻辑">3.4 Recovering（恢复）状态的核心逻辑</h3>
+<p>恢复阶段的目标是逐步将流量放回到原始服务，同时验证服务是否稳定（不再次触发熔断条件）。核心机制是 “线性递增允许通过的请求比例” 和 “持续监控错误条件”。</p>
+<h4 id="341-渐进式流量控制比例控制器ratiocontroller">3.4.1. 渐进式流量控制：比例控制器（ratioController）</h4>
+<p>恢复阶段通过ratioController控制允许通过的请求比例，规则为线性增长：</p>
+<pre><code>//	allowedRequestsRatio = 0.5 * (Now() - StartRecovery())/RecoveryDuration
+即：
+allowedRequestsRatio = 0.5 * (当前时间 - 恢复开始时间) / recoveryDuration
+</code></pre>
+<ul>
+<li>恢复开始时（t=0）：allowedRequestsRatio = 0 → 几乎不允许请求通过（仅极少量试探）。</li>
+<li>恢复中期（t = recoveryDuration/2）：allowedRequestsRatio = 0.25 → 允许 25% 的请求通过。</li>
+<li>恢复结束时（t = recoveryDuration）：allowedRequestsRatio = 0.5 → 允许 50% 的请求通过（注：代码中系数为 0.5，最终最大比例为 50%，而非 100%，确保即使恢复完成也留有缓冲）。<br>
+ratioController的allowRequest()方法会根据当前时间计算比例，并随机决定是否允许当前请求通过（类似 “概率性放量”），例如：当比例为 25% 时，约 25% 的请求会被放行到原始服务，其余仍降级。</li>
+</ul>
+<h4 id="342-恢复阶段的请求处理流程">3.4.2  恢复阶段的请求处理流程</h4>
+<p>在Recovering状态下，每次请求到来时的处理逻辑（activateFallback函数）：</p>
+<pre><code>case stateRecovering:
+    // 检查恢复阶段是否结束
+    if clock.Now().UTC().After(c.until) {
+        c.setState(stateStandby, clock.Now().UTC()) // 恢复完成，回到正常状态
+        return false // 允许所有请求通过
+    }
+    // 未结束：由比例控制器决定是否允许当前请求
+    if c.rc.allowRequest() {
+        return false // 允许请求通过，访问原始服务
+    }
+    return true // 不允许，触发降级
+</code></pre>
+<ul>
+<li>若恢复时间未结束：按比例控制器的规则决定是否放行请求。</li>
+<li>若恢复时间已结束（超过recoveryDuration）：直接切换到Standby状态，所有请求恢复正常通行。</li>
+</ul>
+<h4 id="343-恢复阶段的稳定性校验">3.4.3. 恢复阶段的稳定性校验</h4>
+<p>在恢复阶段，每次请求处理后会通过checkAndSet()函数定期（checkPeriod，默认 100ms）校验熔断条件：</p>
+<pre><code>func (c *CircuitBreaker) checkAndSet() {
+    if !c.timeToCheck() { // 未到检查时间，跳过
+        return
+    }
+    // 加锁后检查熔断条件
+    if c.condition(c) { // 若再次满足熔断条件（如错误率过高）
+        c.setState(stateTripped, clock.Now().UTC().Add(c.fallbackDuration)) // 重新进入熔断状态
+        c.metrics.Reset() // 重置监控指标，重新统计
+    }
+}
+</code></pre>
+<ul>
+<li>若在恢复阶段中，熔断条件（如错误率超过阈值）再次被触发：立即从Recovering切回Tripped状态，重新开始熔断计时（fallbackDuration），相当于 “恢复失败”。</li>
+<li>若整个恢复阶段（recoveryDuration）内未触发熔断条件：恢复结束后切回Standby状态，即 “恢复成功”。</li>
+</ul>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#%E4%B8%80-%E4%BB%80%E4%B9%88%E6%98%AF%E7%86%94%E6%96%AD">一、什么是熔断？</a></li>
+<li><a href="#%E4%BA%8C-traefik-%E7%86%94%E6%96%AD%E6%8F%92%E4%BB%B6%E4%BB%8B%E7%BB%8D">二、 traefik 熔断插件介绍</a>
+<ul>
+<li><a href="#21-%E6%A0%B8%E5%BF%83%E9%85%8D%E7%BD%AE%E5%8F%82%E6%95%B0%E6%BA%90%E7%A0%81%E5%92%8C-yaml%E5%A6%82%E4%B8%8B">2.1 核心配置参数源码和 YAML如下</a></li>
+<li><a href="#22-expression%E8%A1%A8%E8%BE%BE%E5%BC%8F%E6%9C%89%E4%BB%A5%E4%B8%8B%E4%B8%89%E7%A7%8D%E7%B1%BB%E5%9E%8B">2.2 expression表达式有以下三种类型：</a></li>
+<li><a href="#23-yaml%E7%A4%BA%E4%BE%8B">2.3 YAML示例：</a>
+<ul>
+<li><a href="#231-%E5%9F%BA%E7%A1%80%E7%86%94%E6%96%AD%E9%85%8D%E7%BD%AE%E5%9F%BA%E4%BA%8E%E7%BD%91%E7%BB%9C%E9%94%99%E8%AF%AF%E7%8E%87">2.3.1. 基础熔断配置（基于网络错误率）</a></li>
+<li><a href="#232-%E5%9F%BA%E4%BA%8E%E5%93%8D%E5%BA%94%E7%8A%B6%E6%80%81%E7%A0%81%E5%92%8C%E5%BB%B6%E8%BF%9F%E7%9A%84%E7%BB%84%E5%90%88%E6%9D%A1%E4%BB%B6">2.3.2. 基于响应状态码和延迟的组合条件</a></li>
+<li><a href="#233-%E8%87%AA%E5%AE%9A%E4%B9%89%E6%81%A2%E5%A4%8D%E9%98%B6%E6%AE%B5%E7%9A%84%E6%B5%81%E9%87%8F%E6%AF%94%E4%BE%8B">2.3.3. 自定义恢复阶段的流量比例</a></li>
+<li><a href="#234-%E5%9F%BA%E4%BA%8E%E8%B7%AF%E5%BE%84%E7%9A%84%E7%86%94%E6%96%AD%E9%85%8D%E7%BD%AE">2.3.4. 基于路径的熔断配置</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a href="#%E4%B8%89-%E7%86%94%E6%96%AD%E7%8A%B6%E6%80%81%E6%9C%BA">三 熔断状态机</a>
+<ul>
+<li><a href="#31-%E7%86%94%E6%96%AD%E5%99%A8%E6%9C%89%E4%B8%89%E4%B8%AA%E7%8A%B6%E6%80%81">3.1 熔断器有三个状态:</a></li>
+<li><a href="#32-%E7%86%94%E6%96%AD%E5%99%A8%E7%9A%84%E6%81%A2%E5%A4%8D%E8%A1%8C%E4%B8%BA%E7%94%B1%E4%BB%A5%E4%B8%8B%E5%8F%82%E6%95%B0%E6%8E%A7%E5%88%B6">3.2 熔断器的恢复行为由以下参数控制</a></li>
+<li><a href="#33-%E4%BB%8E%E7%86%94%E6%96%ADtripped%E5%88%B0%E6%81%A2%E5%A4%8Drecovering%E7%9A%84%E8%A7%A6%E5%8F%91">3.3 从熔断（Tripped）到恢复（Recovering）的触发</a>
+<ul>
+<li><a href="#331-tripped-%E7%8A%B6%E6%80%81%E7%9A%84%E6%8C%81%E7%BB%AD%E6%A3%80%E6%9F%A5">3.3.1 Tripped 状态的持续检查：</a></li>
+<li><a href="#332-%E8%BF%9B%E5%85%A5-recovering-%E7%8A%B6%E6%80%81%E7%9A%84%E5%88%9D%E5%A7%8B%E5%8C%96">3.3.2 进入 Recovering 状态的初始化：</a></li>
+</ul>
+</li>
+<li><a href="#34-recovering%E6%81%A2%E5%A4%8D%E7%8A%B6%E6%80%81%E7%9A%84%E6%A0%B8%E5%BF%83%E9%80%BB%E8%BE%91">3.4 Recovering（恢复）状态的核心逻辑</a>
+<ul>
+<li><a href="#341-%E6%B8%90%E8%BF%9B%E5%BC%8F%E6%B5%81%E9%87%8F%E6%8E%A7%E5%88%B6%E6%AF%94%E4%BE%8B%E6%8E%A7%E5%88%B6%E5%99%A8ratiocontroller">3.4.1. 渐进式流量控制：比例控制器（ratioController）</a></li>
+<li><a href="#342-%E6%81%A2%E5%A4%8D%E9%98%B6%E6%AE%B5%E7%9A%84%E8%AF%B7%E6%B1%82%E5%A4%84%E7%90%86%E6%B5%81%E7%A8%8B">3.4.2  恢复阶段的请求处理流程</a></li>
+<li><a href="#343-%E6%81%A2%E5%A4%8D%E9%98%B6%E6%AE%B5%E7%9A%84%E7%A8%B3%E5%AE%9A%E6%80%A7%E6%A0%A1%E9%AA%8C">3.4.3. 恢复阶段的稳定性校验</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/harbor-201-cpu-da-man-ding-wei-he-jie-jue/">
+              <h3 class="post-title">
+                Harbor 2.0.1 CPU 打满定位和解决
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>

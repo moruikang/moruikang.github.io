@@ -1,0 +1,414 @@
+<html>
+  <head>
+    <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>python实现简单的DAG任务工作流 | Gridea</title>
+<link rel="shortcut icon" href="https://moruikang.github.io/favicon.ico?v=1766469477645">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@2.3.0/fonts/remixicon.css" rel="stylesheet">
+<link rel="stylesheet" href="https://moruikang.github.io/styles/main.css">
+<link rel="alternate" type="application/atom+xml" title="python实现简单的DAG任务工作流 | Gridea - Atom Feed" href="https://moruikang.github.io/atom.xml">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Droid+Serif:400,700">
+
+
+
+    <meta name="description" content="背景
+近期完成了一个基于Python的电芯生产数据分析项目。该项目需要针对现有Doris宽表中的业务参数数据，创建多个批次组之间的实验组与对照组分析任务。数据规模庞大——每个批次包含几万到数百万根电芯，每根电芯在生产过程中会产生一百多个参数..." />
+    <meta name="keywords" content="" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.10.0/katex.min.css">
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.5.1/build/highlight.min.js"></script>
+  </head>
+  <body>
+    <div class="main">
+      <div class="main-content">
+        <div class="site-header">
+  <a href="https://moruikang.github.io">
+  <img class="avatar" src="https://moruikang.github.io/images/avatar.png?v=1766469477645" alt="">
+  </a>
+  <h1 class="site-title">
+    Gridea
+  </h1>
+  <p class="site-description">
+    日常成长提炼
+  </p>
+  <div class="menu-container">
+    
+      
+        <a href="/" class="menu">
+          首页
+        </a>
+      
+    
+      
+        <a href="/archives" class="menu">
+          归档
+        </a>
+      
+    
+      
+        <a href="/tags" class="menu">
+          标签
+        </a>
+      
+    
+      
+        <a href="/post/about" class="menu">
+          关于
+        </a>
+      
+    
+  </div>
+  <div class="social-container">
+    
+      
+    
+      
+    
+      
+    
+      
+    
+      
+    
+  </div>
+</div>
+
+        <div class="post-detail">
+          <article class="post">
+            <h2 class="post-title">
+              python实现简单的DAG任务工作流
+            </h2>
+            <div class="post-info">
+              <span>
+                2024-11-01
+              </span>
+              <span>
+                9 min read
+              </span>
+              
+            </div>
+            
+            <div class="post-content-wrapper">
+              <div class="post-content" v-pre>
+                <h2 id="背景">背景</h2>
+<p>近期完成了一个基于Python的电芯生产数据分析项目。该项目需要针对现有Doris宽表中的业务参数数据，创建多个批次组之间的实验组与对照组分析任务。数据规模庞大——每个批次包含几万到数百万根电芯，每根电芯在生产过程中会产生一百多个参数值。比如我有2个实验组批次 vs 2个对照组批次，每个批次10w个电芯，那么我的全部参数值数据量为：4 * 100000 * 100 = 4亿个参数值，对应到宽表里则是4亿条记录。</p>
+<p>在分析流程中，我们首先需要根据分析组（实验组或对照组）从数据库中查询各电芯批次的参数数据，随后使用numpy、pandas为每个电芯批次分别计算各个参数的1/4分位数（Q1）、中位数、3/4分位数（Q3）、均值、方差等统计特征值，并将这些特征值记录到中间过程表中。这一阶段我们称之为 “<strong>求特征值任务</strong>”阶段，由于其涉及大量数据库读写操作，属于典型的<strong>IO密集型任务</strong>。</p>
+<p>紧接着，系统会加载中间过程表中的特征值数据，并运用预设的判异规则，对实验组与对照组中的电芯批次进行两两比较与判异分析。此阶段称为 “<strong>判异任务</strong>”阶段，因其以数值计算和规则判断为主，属于<strong>计算密集型任务</strong>。</p>
+<p>为快速完成初版迭代，我们第一版本采用单线程模型实现了基本业务逻辑。随后，为进一步提升代码可维护性与执行效率，我们对业务流程进行了梳理（具体流程见下图），发现该业务场景实际上构成了一个有向无环图（DAG）。基于这一认识，我们决定采用工作流思想，结合线程池技术对代码进行优化与加速。</p>
+<p>具体的业务流程见下图：<br>
+<img src="https://moruikang.github.io/post-images/1756818768930.png" alt="" loading="lazy"></p>
+<h2 id="系统设计与实现">系统设计与实现</h2>
+<h3 id="1-任务单元封装task类">1、任务单元封装：Task类</h3>
+<p>我们首先对任务单元进行了抽象封装，定义Task类作为所有任务执行的代理单元。每个Task实例包含任务名称、实际执行函数及其依赖的前置任务列表。此外，我们还引入了线程安全的停止标志机制，以支持任务执行过程中的优雅中断。</p>
+<pre><code># task.py
+import threading
+from typing import Callable, List, Optional
+
+class Task:
+    &quot;&quot;&quot;
+    用于封装代理，执行真正的任务
+    &quot;&quot;&quot;
+    def __init__(
+        self,
+        name: str,
+        func: Callable[[threading.Event], Optional[str]],
+        dependencies: Optional[List[str]] = None,
+    ):
+        self.name: str = name  # 任务名称
+        self.func: Callable[[threading.Event], Optional[str]] = func  # 任务执行的函数
+        self.dependencies: List[str] = dependencies or []  # 前置任务
+        self.result: Optional[str] = None  # 执行结果
+
+    def run(self, stop_execution: threading.Event) -&gt; Optional[str]:
+        &quot;&quot;&quot;
+        执行任务。如果终止标志被设置，则跳过任务执行。
+        &quot;&quot;&quot;
+        if stop_execution.is_set():
+            print(f&quot;Skipping task: {self.name} due to stop signal.&quot;)
+            return None
+        print(f&quot;Starting task: {self.name}&quot;)
+        self.result = self.func(stop_execution)  # 传入停止标志
+        print(f&quot;Completed task: {self.name}&quot;)
+        return self.result
+</code></pre>
+<h4 id="设计说明">设计说明：</h4>
+<ul>
+<li><strong>停止标志传递</strong>：通过threading.Event实现跨线程的中断信号传递，确保任一任务失败时能及时终止整个流程。</li>
+<li><strong>依赖管理</strong>：通过dependencies列表明确任务间的执行顺序关系，为后续DAG调度奠定基础。</li>
+<li><strong>结果缓存</strong>：每个任务执行结果存储在result属性中，供依赖此任务的其他任务访问。</li>
+</ul>
+<h3 id="2-dag构建与任务拆解dag类">2、DAG构建与任务拆解：Dag类</h3>
+<p>Dag类负责从数据库获取参数配置，并根据参数间的父子关系拆解为特征值计算和判异分析两类任务，构建完整的DAG结构。</p>
+<pre><code># dag.py
+import threading
+import time
+from typing import List, Optional
+from models import ParameterModel
+from task import Task
+class Dag(object):
+
+    def __init__(self, task_code = None):
+        self.task_code = task_code
+        self.parameters = self.get_all_parameters()
+        self.parameter_tasks = dict()
+        self.eigenvalue_task_suffix = &quot;_eigenvalue&quot;
+        self.abnormal_task_suffix = &quot;_abnormal&quot;
+
+    def get_all_parameters(self):
+        return ParameterModel.objects.filter(task_code = self.task_code).distinct()
+
+    def calculate_eigenvalue(self, param_code: str, stop_execution: threading.Event) -&gt; Optional[str]:
+        &quot;&quot;&quot;
+        模拟特征值计算任务。
+        param_code: 参数编码
+        stop_execution: 停止信号标志
+        &quot;&quot;&quot;
+        for _ in range(4):  # 模拟分步计算
+            if stop_execution.is_set():
+                print(f&quot;[{param_code}] eigenvalue calculation aborted.&quot;)
+                return None
+            time.sleep(0.5)  # 模拟数据库查询、计算特征值时间
+        print(f&quot;[{param_code}] eigenvalue calculated.&quot;)
+        return f&quot;{param_code}_eigenvalue&quot;
+
+    def calculate_abnomaly(self, param_code: str, stop_execution: threading.Event) -&gt; Optional[str]:
+        &quot;&quot;&quot;
+        模拟参数判异任务。
+        param_code: 参数编码
+        stop_execution: 停止信号标志
+        &quot;&quot;&quot;
+        for _ in range(4):  # 模拟分步计算
+            if stop_execution.is_set():
+                print(f&quot;[{param_code}] abnomaly calculation aborted.&quot;)
+                return None
+            time.sleep(0.5)  # 模拟加载特征值到内存，判异计算时间
+        print(f&quot;[{param_code}] abnomaly calculated.&quot;)
+        return f&quot;{param_code}_abnomaly&quot;
+
+    def _build_task_name(self, tasks : List[str], ):
+
+        return &quot;&quot;.join(tasks)
+
+    def dismantling_tasks(self):
+        &quot;&quot;&quot;
+        拆解任务
+        :return: tasks
+        &quot;&quot;&quot;
+
+        for parameter in self.parameters:
+
+            # 参数编码
+            parameter_code = parameter.parameter_code
+            # 父级参数编码
+            parent_code = parameter.parent_code
+
+            eigenvalue_task_name = self._build_task_name([parameter_code, self.eigenvalue_task_suffix])
+            abnormal_task_name = self._build_task_name([parameter_code, self.abnormal_task_suffix])
+
+            self.parameter_tasks[eigenvalue_task_name] = {&quot;parameter_code&quot;: parent_code, &quot;dependencies&quot;: []}
+            self.parameter_tasks[abnormal_task_name] = {&quot;parameter_code&quot;: parent_code, &quot;dependencies&quot;: [eigenvalue_task_name]}
+
+            if parent_code:
+                self.parameter_tasks[eigenvalue_task_name]['dependencies'] = [self._build_task_name([parent_code, self.abnormal_task_suffix])]
+
+    def build_dag(self):
+        '''
+        构建有向无环图任务
+        :return:
+        '''
+        if not self.parameter_tasks:
+            self.dismantling_tasks()
+
+        tasks = {
+            task_name: Task(
+                task_name,
+                lambda stop_execution: self.calculate_eigenvalue(task_info['parameter_code'], stop_execution) if self.eigenvalue_task_suffix in task_name else \
+                lambda stop_execution: self.calculate_abnomaly(task_info['parameter_code'], stop_execution),
+                dependencies=list(task_info['dependencies'])
+            )
+            for task_name, task_info in self.parameter_tasks.items()
+        }
+        return tasks
+</code></pre>
+<h4 id="设计说明-2">设计说明：</h4>
+<ul>
+<li><strong>参数依赖处理</strong>：通过parent_code识别参数间的层级关系，确保父参数判异分析完成后才进行子参数的特征值计算。</li>
+<li><strong>任务命名规范</strong>：采用统一的命名规则（参数编码+任务类型后缀）便于任务识别与管理。</li>
+<li><strong>动态任务生成</strong>：根据参数配置动态生成对应的特征值计算和判异分析任务，提高系统灵活性。</li>
+</ul>
+<h3 id="3-任务调度与执行taskexecutor类">3、任务调度与执行：TaskExecutor类</h3>
+<p>TaskExecutor作为系统的核心调度器，实现了基于线程池的DAG任务调度算法，支持依赖感知的任务执行与异常处理。</p>
+<pre><code># task_executor.py
+
+import threading
+from asyncio import as_completed
+from concurrent.futures import ThreadPoolExecutor
+from typing import List
+from dag import Dag
+from task import Task
+
+class TaskExecutor:
+
+    def __int__(self, task_code):
+        self.task_code = task_code
+        self.tasks = dict[str, Task]
+
+    def execute_tasks(self) -&gt; None:
+        &quot;&quot;&quot;
+        执行所有任务，支持依赖关系和中止标志。
+        &quot;&quot;&quot;
+        stop_execution = threading.Event()  # 创建线程安全的标志位
+
+        if not self.tasks:
+            self.tasks = Dag(self.task_code).build_dag()
+        # 创建一个完整的任务映射（用于依赖检查）
+        all_tasks = self.tasks.copy()
+
+        # 查找可执行任务
+        def find_ready_tasks() -&gt; List[Task]:
+            return [
+                task
+                for name, task in remaining_tasks.items()
+                if task.result is None
+                   and all(all_tasks[dep].result is not None for dep in task.dependencies)
+                   and not stop_execution.is_set()  # 检查是否设置了终止标志
+            ]
+        remaining_tasks = self.tasks.copy()  # 创建一个用于管理未完成任务的副本
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures: dict = {}
+            while remaining_tasks and not stop_execution.is_set():
+                ready_tasks = find_ready_tasks()
+                if not ready_tasks:
+                    break  # 没有可执行任务，说明完成
+
+                for task in ready_tasks:
+                    if stop_execution.is_set():  # 如果终止标志已设置，停止调度
+                        break
+                    # 提交任务到线程池
+                    futures[executor.submit(task.run, stop_execution)] = task
+                    del remaining_tasks[task.name]  # 从未完成任务字典中移除
+
+                # 等待部分任务完成
+                for future in as_completed(futures):
+                    task = futures[future]
+                    try:
+                        future.result()  # 检查任务是否异常
+                    except Exception as e:
+                        print(f&quot;Task {task.name} failed with exception: {e}&quot;)
+                        stop_execution.set()  # 设置标志位，终止任务调度
+                        break
+                # 如果标志位已设置，退出调度
+                if stop_execution.is_set():
+                    print(&quot;Stopping all tasks due to failure.&quot;)
+                    break
+
+if __name__ == &quot;__main__&quot;:
+    # 模拟任务
+    TaskExecutor(task_code =&quot;TASK001&quot;).execute_tasks()
+</code></pre>
+<h4 id="设计说明-3">设计说明：</h4>
+<ul>
+<li><strong>依赖感知调度</strong>：通过find_ready_tasks函数动态识别依赖条件满足的可执行任务，确保执行顺序正确性。</li>
+<li><strong>线程池管理</strong>：使用ThreadPoolExecutor管理线程资源，控制并发度（本例中为4个worker）。</li>
+<li><strong>异常传播机制</strong>：任一任务执行失败时，通过stop_execution事件通知其他任务终止，避免资源浪费。</li>
+<li><strong>非阻塞调度</strong>：采用&quot;提交-等待&quot;循环模式，既保证任务依赖关系，又最大化利用线程池并行能力。</li>
+</ul>
+
+              </div>
+              <div class="toc-container">
+                <ul class="markdownIt-TOC">
+<li>
+<ul>
+<li><a href="#%E8%83%8C%E6%99%AF">背景</a></li>
+<li><a href="#%E7%B3%BB%E7%BB%9F%E8%AE%BE%E8%AE%A1%E4%B8%8E%E5%AE%9E%E7%8E%B0">系统设计与实现</a>
+<ul>
+<li><a href="#1-%E4%BB%BB%E5%8A%A1%E5%8D%95%E5%85%83%E5%B0%81%E8%A3%85task%E7%B1%BB">1、任务单元封装：Task类</a>
+<ul>
+<li><a href="#%E8%AE%BE%E8%AE%A1%E8%AF%B4%E6%98%8E">设计说明：</a></li>
+</ul>
+</li>
+<li><a href="#2-dag%E6%9E%84%E5%BB%BA%E4%B8%8E%E4%BB%BB%E5%8A%A1%E6%8B%86%E8%A7%A3dag%E7%B1%BB">2、DAG构建与任务拆解：Dag类</a>
+<ul>
+<li><a href="#%E8%AE%BE%E8%AE%A1%E8%AF%B4%E6%98%8E-2">设计说明：</a></li>
+</ul>
+</li>
+<li><a href="#3-%E4%BB%BB%E5%8A%A1%E8%B0%83%E5%BA%A6%E4%B8%8E%E6%89%A7%E8%A1%8Ctaskexecutor%E7%B1%BB">3、任务调度与执行：TaskExecutor类</a>
+<ul>
+<li><a href="#%E8%AE%BE%E8%AE%A1%E8%AF%B4%E6%98%8E-3">设计说明：</a></li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+</li>
+</ul>
+
+              </div>
+            </div>
+          </article>
+        </div>
+
+        
+          <div class="next-post">
+            <div class="next">下一篇</div>
+            <a href="https://moruikang.github.io/post/rancher-ru-he-gei-yong-hu-dui-k8s-zi-yuan-shou-quan/">
+              <h3 class="post-title">
+                Rancher如何给用户对k8s资源授权？
+              </h3>
+            </a>
+          </div>
+        
+
+        
+
+        <div class="site-footer">
+  Powered by <a href="https://github.com/getgridea/gridea" target="_blank">Gridea</a>
+  <a class="rss" href="https://moruikang.github.io/atom.xml" target="_blank">
+    <i class="ri-rss-line"></i> RSS
+  </a>
+</div>
+
+      </div>
+    </div>
+
+    <script>
+      hljs.initHighlightingOnLoad()
+
+      let mainNavLinks = document.querySelectorAll(".markdownIt-TOC a");
+
+      // This should probably be throttled.
+      // Especially because it triggers during smooth scrolling.
+      // https://lodash.com/docs/4.17.10#throttle
+      // You could do like...
+      // window.addEventListener("scroll", () => {
+      //    _.throttle(doThatStuff, 100);
+      // });
+      // Only not doing it here to keep this Pen dependency-free.
+
+      window.addEventListener("scroll", event => {
+        let fromTop = window.scrollY;
+
+        mainNavLinks.forEach((link, index) => {
+          let section = document.getElementById(decodeURI(link.hash).substring(1));
+          let nextSection = null
+          if (mainNavLinks[index + 1]) {
+            nextSection = document.getElementById(decodeURI(mainNavLinks[index + 1].hash).substring(1));
+          }
+          if (section.offsetTop <= fromTop) {
+            if (nextSection) {
+              if (nextSection.offsetTop > fromTop) {
+                link.classList.add("current");
+              } else {
+                link.classList.remove("current");    
+              }
+            } else {
+              link.classList.add("current");
+            }
+          } else {
+            link.classList.remove("current");
+          }
+        });
+      });
+
+    </script>
+  </body>
+</html>
